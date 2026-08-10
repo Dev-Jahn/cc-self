@@ -1,0 +1,17 @@
+{
+  "name": "cc-self-marketplace",
+  "owner": {
+    "name": "Dev-Jahn"
+  },
+  "plugins": [
+    {
+      "name": "cc-self",
+      "source": "./",
+      "description": "Self-control for Claude Code sessions running in tmux: type slash commands into your own TUI, answer your own dialogs, observe your own screen, and restart yourself in place.",
+      "category": "development",
+      "homepage": "https://github.com/Dev-Jahn/cc-self",
+      "keywords": ["tmux", "self-control", "automation", "session", "restart"],
+      "version": "1.0.2"
+    }
+  ]
+}

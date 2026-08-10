@@ -1,0 +1,7 @@
+# runtime artifacts written by cc-self at execution time
+.cc-self.log
+.cc-self-restart-driver.sh
+.cc-self-waker.sh
+
+# OS cruft
+.DS_Store
