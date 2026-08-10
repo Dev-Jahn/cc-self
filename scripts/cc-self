@@ -1,0 +1,209 @@
+#!/bin/bash
+# ============================================================================
+# cc-self — let a Claude Code session control its own TUI
+#
+# The session's Bash tool runs inside the same tmux pane as the Claude Code
+# TUI, so `tmux send-keys` to that pane ($TMUX_PANE) is literally typing into
+# the session's own input box. This unlocks user-side slash commands
+# (/reload-plugins, /effort, /model, /plugin ...), dialog navigation, and
+# even full self-restart.
+#
+# usage:
+#   cc-self type "/reload-plugins"    type text + Enter (default)
+#   cc-self type -w "/reload-plugins" ...then queue a wake-up message after it
+#                                     (slash commands alone never re-invoke the
+#                                     model — chain -w to continue autonomously)
+#   cc-self type -n "text"            type without Enter (stage in input box)
+#   cc-self key <name>                send one special key (Escape, C-u, Up...)
+#   cc-self clear                     empty the input box (backspace burst)
+#   cc-self peek [N]                  show last N lines of the pane (default 20)
+#   cc-self pane                      show target pane info
+#   cc-self sid                       print current session id
+#   cc-self restart [session-id]      restart own session (delegates a driver
+#                                     to the tmux server: waits for turn end,
+#                                     /exit, claude --resume, wake-up message)
+#
+# target pane priority: --pane <id> > $CC_SELF_PANE > $TMUX_PANE (self)
+# every send is logged to $CC_SELF_LOG (default ~/.cc-self.log)
+#
+# notes:
+#  - `type` sends text only. Control keys must go through `key` — prevents
+#    accidentally interrupting the session's own turn (Escape) or killing it.
+#  - vim keybindings: when the pane shows `-- NORMAL --`, an `i` is sent
+#    first to enter INSERT mode (typing into NORMAL mode gets eaten as vim
+#    commands — "cc" is change-line).
+#  - slash commands with arguments execute immediately even mid-turn and may
+#    open confirmation dialogs: peek first, then `key Enter` deliberately.
+# ============================================================================
+set -u
+
+LOG="${CC_SELF_LOG:-$HOME/.cc-self.log}"
+PANE="${CC_SELF_PANE:-${TMUX_PANE:-}}"
+
+usage() { sed -n '5,26p' "$0" | sed 's/^# \{0,1\}//'; exit 1; }
+logit() { printf '%s pane=%s %s\n' "$(date '+%F %T')" "$PANE" "$*" >> "$LOG"; }
+
+resolve_sid() {
+  if [ -n "${CLAUDE_SESSION_ID:-}" ]; then printf '%s' "$CLAUDE_SESSION_ID"; return; fi
+  local d
+  d="$HOME/.claude/projects/$(pwd | sed 's|/|-|g')"
+  # shellcheck disable=SC2012  # transcript filenames are UUIDs (no spaces/newlines); ls -t sorts by mtime cleanly
+  ls -t "$d"/*.jsonl 2>/dev/null | head -1 | sed -E 's|.*/||; s|\.jsonl$||'
+}
+
+# parse --pane anywhere in the arg list
+ARGS=()
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --pane) PANE="$2"; shift 2 ;;
+    *) ARGS+=("$1"); shift ;;
+  esac
+done
+set -- ${ARGS[@]+"${ARGS[@]}"}
+
+[ $# -ge 1 ] || usage
+CMD="$1"; shift
+
+case "$CMD" in sid) resolve_sid; echo; exit 0 ;; esac
+
+[ -n "$PANE" ] || { echo "cc-self: cannot determine target pane (not inside tmux?)"; exit 1; }
+tmux has-session 2>/dev/null || { echo "cc-self: no tmux server"; exit 1; }
+
+case "$CMD" in
+  pane)
+    tmux display-message -p -t "$PANE" \
+      '#{pane_id} #{session_name}:#{window_index}.#{pane_index} cmd=#{pane_current_command} title=#{pane_title}'
+    ;;
+  peek)
+    N="${1:-20}"
+    tmux capture-pane -p -t "$PANE" | sed -e :a -e '/^[[:space:]]*$/{$d;N;ba' -e '}' | tail -n "$N"
+    ;;
+  type)
+    NO_ENTER=0; WAKE=0
+    while :; do
+      case "${1:-}" in
+        -n) NO_ENTER=1; shift ;;
+        -w|--wake) WAKE=1; shift ;;
+        *) break ;;
+      esac
+    done
+    [ $# -ge 1 ] || { echo "cc-self type: nothing to send"; exit 1; }
+    TEXT="$*"
+    send_line() {  # type one line, entering INSERT first if vim NORMAL mode
+      if tmux capture-pane -p -t "$PANE" | tail -6 | grep -qE -- '-- NORMAL --|\[NORMAL\]'; then
+        tmux send-keys -t "$PANE" -l 'i'
+        sleep 0.2
+      fi
+      tmux send-keys -t "$PANE" -l -- "$1"
+      sleep 0.3   # let the TUI process input (autocomplete popup etc.)
+    }
+    send_line "$TEXT"
+    [ "$NO_ENTER" -eq 0 ] && tmux send-keys -t "$PANE" Enter
+    if [ "$WAKE" -eq 1 ]; then
+      # Slash commands execute locally and never start a model turn. A plain
+      # message CANNOT simply be queued behind them: mid-turn, the TUI injects
+      # queued plain text into the RUNNING turn while slash commands stay
+      # queued — the wake would be consumed before the command runs. So the
+      # wake is typed by a detached waker (tmux server process) that waits for
+      # the turn to end and queued commands to drain first.
+      TMUX_BIN="$(command -v tmux)"
+      WAKER="$HOME/.cc-self-waker.sh"
+      cat > "$WAKER" <<'WKR'
+#!/bin/bash
+PANE="$1"; NOTE="$2"; TMUX_BIN="$3"
+log() { printf '%s [waker] %s\n' "$(date '+%F %T')" "$*"; }
+log "armed pane=$PANE"
+sleep 5
+idle=0
+for _ in $(seq 1 90); do   # wait for the running turn to end (max 3 min)
+  if "$TMUX_BIN" capture-pane -p -t "$PANE" | grep -q 'to interrupt'; then idle=0; else idle=$((idle+1)); fi
+  [ "$idle" -ge 3 ] && break
+  sleep 2
+done
+sleep 2                    # let queued slash commands drain
+"$TMUX_BIN" capture-pane -p -t "$PANE" | tail -6 | grep -qE -- '-- NORMAL --' \
+  && { "$TMUX_BIN" send-keys -t "$PANE" -l 'i'; sleep 0.3; }
+"$TMUX_BIN" send-keys -t "$PANE" -l -- "[cc-self wake] continue after: $NOTE"
+sleep 0.5
+"$TMUX_BIN" send-keys -t "$PANE" Enter
+log "wake sent"
+WKR
+      chmod +x "$WAKER"
+      tmux run-shell -b "/bin/bash '$WAKER' '$PANE' '$TEXT' '$TMUX_BIN' >> '$LOG' 2>&1"
+    fi
+    logit "type$([ $NO_ENTER -eq 1 ] && echo ' (no-enter)')$([ $WAKE -eq 1 ] && echo ' (+wake)'): $TEXT"
+    echo "sent to $PANE: $TEXT$([ $NO_ENTER -eq 1 ] && echo ' (no Enter)')$([ $WAKE -eq 1 ] && echo ' (+wake queued)')"
+    ;;
+  key)
+    [ $# -ge 1 ] || { echo "cc-self key: key name required (e.g. Escape, C-u, Up)"; exit 1; }
+    tmux send-keys -t "$PANE" "$1"
+    logit "key: $1"
+    echo "sent key to $PANE: $1"
+    ;;
+  clear)
+    tmux send-keys -N 80 -t "$PANE" BSpace
+    logit "clear"
+    echo "cleared input of $PANE"
+    ;;
+  restart)
+    # The session's own death kills its Bash tool too, so the restart
+    # sequence is delegated to a process owned by the tmux server
+    # (run-shell -b), which outlives the session.
+    SID="${1:-$(resolve_sid)}"
+    [ -n "$SID" ] || { echo "cc-self restart: cannot resolve session id (pass it explicitly)"; exit 1; }
+    CLAUDE_BIN="${CC_SELF_CLAUDE_BIN:-}"
+    if [ -z "$CLAUDE_BIN" ]; then
+      CLAUDE_BIN="$(command -v claude 2>/dev/null || true)"
+      case "$CLAUDE_BIN" in ''|alias*) CLAUDE_BIN="$HOME/.local/bin/claude" ;; esac
+    fi
+    [ -x "$CLAUDE_BIN" ] || { echo "cc-self restart: claude binary not found: $CLAUDE_BIN"; exit 1; }
+    TMUX_BIN="$(command -v tmux)"
+    DRIVER="$HOME/.cc-self-restart-driver.sh"
+    cat > "$DRIVER" <<'DRV'
+#!/bin/bash
+# cc-self restart driver — runs detached under the tmux server
+PANE="$1"; SID="$2"; BIN="$3"; TMUX_BIN="$4"
+log() { printf '%s [restart-driver] %s\n' "$(date '+%F %T')" "$*"; }
+fg()  { "$TMUX_BIN" display-message -p -t "$PANE" '#{pane_current_command}'; }
+mode_fix() {  # vim NORMAL mode → INSERT
+  "$TMUX_BIN" capture-pane -p -t "$PANE" | tail -6 | grep -qE -- '-- NORMAL --' \
+    && { "$TMUX_BIN" send-keys -t "$PANE" -l 'i'; sleep 0.3; }
+}
+tui_type() { mode_fix; "$TMUX_BIN" send-keys -t "$PANE" -l -- "$1"; sleep 0.5; "$TMUX_BIN" send-keys -t "$PANE" Enter; }
+
+log "start pane=$PANE sid=$SID"
+sleep 15                              # let the session finish its last message
+idle=0
+for _ in $(seq 1 60); do              # wait for turn streaming to end (max 2 min)
+  if "$TMUX_BIN" capture-pane -p -t "$PANE" | grep -q 'to interrupt'; then idle=0; else idle=$((idle+1)); fi
+  [ "$idle" -ge 3 ] && break
+  sleep 2
+done
+# preserve permission mode: add the bypass flag only if it was on
+FLAGS=""
+"$TMUX_BIN" capture-pane -p -t "$PANE" | grep -q 'bypass permissions on' && FLAGS=" --dangerously-skip-permissions"
+log "turn idle → sending /exit"
+tui_type '/exit'
+for _ in $(seq 1 90); do case "$(fg)" in zsh|bash|fish|sh) break ;; esac; sleep 1; done
+case "$(fg)" in zsh|bash|fish|sh) ;; *) log "FAIL: claude did not exit (fg=$(fg))"; exit 1 ;; esac
+log "claude exited → relaunching (real binary, alias bypassed)"
+sleep 1
+"$TMUX_BIN" send-keys -t "$PANE" -l -- "$BIN --resume $SID$FLAGS"
+sleep 0.5
+"$TMUX_BIN" send-keys -t "$PANE" Enter
+for _ in $(seq 1 60); do case "$(fg)" in zsh|bash|fish|sh) sleep 1 ;; *) break ;; esac; done
+case "$(fg)" in zsh|bash|fish|sh) log "FAIL: claude did not come back"; exit 1 ;; esac
+log "claude relaunched → waiting for session load"
+sleep 12
+tui_type '[cc-self restart driver] Automated restart sequence complete. Verify session continuity and report the result to the user.'
+log "wake-up message sent — driver done"
+DRV
+    chmod +x "$DRIVER"
+    tmux run-shell -b "/bin/bash '$DRIVER' '$PANE' '$SID' '$CLAUDE_BIN' '$TMUX_BIN' >> '$LOG' 2>&1"
+    logit "restart: sid=$SID bin=$CLAUDE_BIN"
+    echo "restart driver armed — after this turn ends: /exit → resume (log: $LOG)"
+    ;;
+  *)
+    usage
+    ;;
+esac
