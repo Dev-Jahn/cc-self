@@ -1,0 +1,49 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: shellcheck (main script)
+        # ubuntu-latest ships shellcheck; -s bash pins the dialect so a bare
+        # `sh` default can never reinterpret bash-only syntax and fail the run.
+        run: shellcheck -s bash scripts/cc-self
+
+      - name: shellcheck (embedded driver + waker)
+        # scripts/cc-self writes two helper scripts to disk at runtime as
+        # single-quoted heredocs; shellcheck does not lint inside heredocs, so
+        # extract and lint them explicitly to keep the whole surface clean.
+        run: |
+          set -euo pipefail
+          sed -n "/cat > \"\$DRIVER\" <<'DRV'/,/^DRV$/p" scripts/cc-self | sed '1d;$d' > /tmp/drv.sh
+          sed -n "/cat > \"\$WAKER\" <<'WKR'/,/^WKR$/p"  scripts/cc-self | sed '1d;$d' > /tmp/wkr.sh
+          shellcheck -s bash /tmp/drv.sh /tmp/wkr.sh
+
+      - name: plugin manifest parses
+        run: |
+          jq -e '.name == "cc-self" and .version and .description' .claude-plugin/plugin.json
+          jq -e '.plugins[] | select(.name == "cc-self")' .claude-plugin/marketplace.json
+
+      - name: skills have frontmatter
+        run: |
+          set -euo pipefail
+          for s in skills/*/SKILL.md; do
+            head -1 "$s" | grep -qx -- '---' || { echo "::error file=$s::missing YAML frontmatter"; exit 1; }
+            grep -qE '^name:' "$s"        || { echo "::error file=$s::missing name"; exit 1; }
+            grep -qE '^description:' "$s" || { echo "::error file=$s::missing description"; exit 1; }
+          done
+
+      - name: version is consistent across manifests
+        run: |
+          set -euo pipefail
+          pv=$(jq -r .version .claude-plugin/plugin.json)
+          mv=$(jq -r '.plugins[] | select(.name=="cc-self") | .version' .claude-plugin/marketplace.json)
+          test "$pv" = "$mv" || { echo "::error::plugin.json ($pv) != marketplace.json ($mv)"; exit 1; }
+          echo "version $pv consistent"
