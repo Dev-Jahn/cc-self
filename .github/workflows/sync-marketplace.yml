@@ -1,0 +1,94 @@
+name: Sync marketplace pin
+
+# When main moves, mirror this repo's sha + plugin.json version/description into
+# Dev-Jahn/jahns-cc-marketplace's marketplace.json so the marketplace always pins
+# the latest commit. Mirrors the pattern used by the hippo/codex plugins.
+#
+# Cross-repo write needs a deploy key scoped to the marketplace repo:
+#   secret MARKETPLACE_DEPLOY_KEY = an ed25519 PRIVATE key whose PUBLIC key is
+#   registered on Dev-Jahn/jahns-cc-marketplace as a write-enabled deploy key.
+#   (The same key hippo uses works — reuse it, or mint a dedicated one.)
+#
+# Until that secret exists the job SKIPS cleanly (green), never fails — so a
+# fresh fork's CI is never red just because the pin secret isn't wired yet.
+on:
+  push:
+    branches: [main]
+    paths:
+      - '.claude-plugin/plugin.json'
+      - 'scripts/**'
+      - 'skills/**'
+  workflow_dispatch:
+
+concurrency:
+  group: sync-marketplace
+  cancel-in-progress: true
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout (read plugin version)
+        uses: actions/checkout@v5
+
+      - name: Guard — secret present?
+        id: guard
+        env:
+          DEPLOY_KEY: ${{ secrets.MARKETPLACE_DEPLOY_KEY }}
+        run: |
+          if [ -z "${DEPLOY_KEY:-}" ]; then
+            echo "MARKETPLACE_DEPLOY_KEY not set — skipping marketplace pin (this is not a failure)."
+            echo "run=0" >> "$GITHUB_OUTPUT"
+          else
+            echo "run=1" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Read plugin version + description
+        if: steps.guard.outputs.run == '1'
+        id: meta
+        run: |
+          echo "version=$(jq -r .version .claude-plugin/plugin.json)" >> "$GITHUB_OUTPUT"
+          {
+            echo "description<<JWEOF"
+            jq -r .description .claude-plugin/plugin.json
+            echo "JWEOF"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Configure deploy key
+        if: steps.guard.outputs.run == '1'
+        env:
+          DEPLOY_KEY: ${{ secrets.MARKETPLACE_DEPLOY_KEY }}
+        run: |
+          mkdir -p ~/.ssh
+          printf '%s\n' "$DEPLOY_KEY" > ~/.ssh/id_ed25519
+          chmod 600 ~/.ssh/id_ed25519
+          ssh-keyscan -t ed25519 github.com >> ~/.ssh/known_hosts 2>/dev/null
+
+      - name: Pin sha + version + description in the marketplace
+        if: steps.guard.outputs.run == '1'
+        env:
+          NEW_SHA: ${{ github.sha }}
+          NEW_VERSION: ${{ steps.meta.outputs.version }}
+          NEW_DESC: ${{ steps.meta.outputs.description }}
+        run: |
+          set -euo pipefail
+          git clone git@github.com:Dev-Jahn/jahns-cc-marketplace.git mp
+          cd mp
+          f=.claude-plugin/marketplace.json
+          jq -e '.plugins[] | select(.name=="cc-self")' "$f" > /dev/null \
+            || { echo "marketplace.json has no plugin entry named 'cc-self' — nothing to pin"; exit 1; }
+          tmp=$(mktemp)
+          jq --indent 2 --arg sha "$NEW_SHA" --arg ver "$NEW_VERSION" --arg desc "$NEW_DESC" \
+            '(.plugins[] | select(.name=="cc-self")) |= (.source.sha = $sha | .version = $ver | .description = $desc)' \
+            "$f" > "$tmp"
+          mv "$tmp" "$f"
+          if git diff --quiet -- "$f"; then
+            echo "marketplace already in sync at ${NEW_SHA} @ v${NEW_VERSION} — nothing to do."
+            exit 0
+          fi
+          git config user.name "cc-self-ci"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add -- "$f"
+          git commit -qm "chore(cc-self): sync v${NEW_VERSION} @ ${NEW_SHA:0:7} (auto-sync from main)"
+          git push origin HEAD:main
+          echo "marketplace updated → v${NEW_VERSION} @ ${NEW_SHA:0:7}"
