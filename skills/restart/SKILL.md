@@ -1,9 +1,9 @@
 ---
 name: restart
 description: This skill should be used when the user asks to "restart your session", "restart yourself", "reload your session", or when the session itself determines a restart is needed (e.g. after a plugin update or harness change that requires a fresh process). Restarts the current Claude Code session in place via /exit + claude --resume, preserving the full conversation.
-argument-hint: "[session-id]"
+argument-hint: "[session-id] [-- extra-resume-flags]"
 allowed-tools: Bash
-version: 1.0.0
+version: 1.1.0
 ---
 
 # Restart Own Session
@@ -30,6 +30,12 @@ resumed session reports back.
    ```bash
    bash <plugin-root>/scripts/cc-self restart <sid>
    ```
+   The driver pins the session's current model and effort onto the resume
+   command automatically. To deliberately change them (or pass any other
+   resume flag), append them after `--` — they replace the pinned ones:
+   ```bash
+   bash <plugin-root>/scripts/cc-self restart <sid> -- --effort max
+   ```
 5. **End the turn promptly** with a one-line notice to the user (expected
    downtime ~15s after the turn ends, plus the driver's turn-end detection).
    Long streaming after arming only delays the sequence.
@@ -39,9 +45,16 @@ resumed session reports back.
 
 ## Notes
 
+- The driver preserves model and effort: at arm time (while the session is
+  alive) it reads them from the transcript's last assistant entry (fallback:
+  `~/.claude/settings.json`) and passes `--model`/`--effort` explicitly on
+  resume. A bare `--resume` would reset effort to the default, and the changed
+  system prompt would break the warm prompt cache. Setting effort via the TUI
+  after resume is too late for the same reason — resume-time CLI args are the
+  only cache-safe path.
 - The driver preserves permission mode: it adds `--dangerously-skip-permissions`
   only if the footer showed "bypass permissions on" before exiting.
-- It launches the real claude binary directly (aliases with extra flags like
-  `--effort` would silently change session state).
+- It launches the real claude binary directly (aliases with extra flags
+  would silently change session state).
 - If the restart stalls, inspect `~/.cc-self.log` — every driver phase is
   logged. Manual recovery: `claude --resume <sid>` in the pane.

@@ -19,9 +19,13 @@
 #   cc-self peek [N]                  show last N lines of the pane (default 20)
 #   cc-self pane                      show target pane info
 #   cc-self sid                       print current session id
-#   cc-self restart [session-id]      restart own session (delegates a driver
+#   cc-self restart [sid] [-- flags]  restart own session (delegates a driver
 #                                     to the tmux server: waits for turn end,
-#                                     /exit, claude --resume, wake-up message)
+#                                     /exit, claude --resume with the session's
+#                                     model/effort pinned, wake-up message).
+#                                     flags after -- are appended to the resume
+#                                     command verbatim and win over the pinned
+#                                     ones (e.g. -- --effort max)
 #
 # target pane priority: --pane <id> > $CC_SELF_PANE > $TMUX_PANE (self)
 # every send is logged to $CC_SELF_LOG (default ~/.cc-self.log)
@@ -40,7 +44,7 @@ set -u
 LOG="${CC_SELF_LOG:-$HOME/.cc-self.log}"
 PANE="${CC_SELF_PANE:-${TMUX_PANE:-}}"
 
-usage() { sed -n '5,26p' "$0" | sed 's/^# \{0,1\}//'; exit 1; }
+usage() { sed -n '5,30p' "$0" | sed 's/^# \{0,1\}//'; exit 1; }
 logit() { printf '%s pane=%s %s\n' "$(date '+%F %T')" "$PANE" "$*" >> "$LOG"; }
 
 resolve_sid() {
@@ -149,20 +153,40 @@ WKR
     # The session's own death kills its Bash tool too, so the restart
     # sequence is delegated to a process owned by the tmux server
     # (run-shell -b), which outlives the session.
-    SID="${1:-$(resolve_sid)}"
+    SID=""
+    if [ $# -ge 1 ] && [ "$1" != "--" ]; then SID="$1"; shift; fi
+    [ -n "$SID" ] || SID="$(resolve_sid)"
     [ -n "$SID" ] || { echo "cc-self restart: cannot resolve session id (pass it explicitly)"; exit 1; }
+    EXTRA=""
+    if [ "${1:-}" = "--" ]; then shift; EXTRA="$*"; fi
     CLAUDE_BIN="${CC_SELF_CLAUDE_BIN:-}"
     if [ -z "$CLAUDE_BIN" ]; then
       CLAUDE_BIN="$(command -v claude 2>/dev/null || true)"
       case "$CLAUDE_BIN" in ''|alias*) CLAUDE_BIN="$HOME/.local/bin/claude" ;; esac
     fi
     [ -x "$CLAUDE_BIN" ] || { echo "cc-self restart: claude binary not found: $CLAUDE_BIN"; exit 1; }
+    # Capture the session's model + effort while it is still alive: a bare
+    # --resume falls back to defaults, so an effort changed mid-session is
+    # lost and the changed system prompt breaks the warm prompt cache.
+    # Freshest source is the transcript's last main-chain assistant entry
+    # (real JSON keys are unescaped there; quotes inside message text are
+    # \"-escaped, so these greps can't match prose). Fallback: settings.json.
+    TRANSCRIPT="$HOME/.claude/projects/$(pwd | sed 's|/|-|g')/$SID.jsonl"
+    MODEL=""; EFFORT=""
+    if [ -f "$TRANSCRIPT" ]; then
+      ALINE="$(grep '"type":"assistant"' "$TRANSCRIPT" | grep -v '"isSidechain":true' | grep '"effort":"' | tail -1)"
+      MODEL="$(printf '%s' "$ALINE" | grep -o '"model":"[^"]*"' | head -1 | cut -d'"' -f4)"
+      EFFORT="$(printf '%s' "$ALINE" | grep -o '"effort":"[a-z]*"' | head -1 | cut -d'"' -f4)"
+    fi
+    SETTINGS="$HOME/.claude/settings.json"
+    [ -n "$MODEL" ]  || MODEL="$(grep -o '"model"[[:space:]]*:[[:space:]]*"[^"]*"' "$SETTINGS" 2>/dev/null | head -1 | cut -d'"' -f4)"
+    [ -n "$EFFORT" ] || EFFORT="$(grep -o '"effortLevel"[[:space:]]*:[[:space:]]*"[^"]*"' "$SETTINGS" 2>/dev/null | head -1 | cut -d'"' -f4)"
     TMUX_BIN="$(command -v tmux)"
     DRIVER="$HOME/.cc-self-restart-driver.sh"
     cat > "$DRIVER" <<'DRV'
 #!/bin/bash
 # cc-self restart driver — runs detached under the tmux server
-PANE="$1"; SID="$2"; BIN="$3"; TMUX_BIN="$4"
+PANE="$1"; SID="$2"; BIN="$3"; TMUX_BIN="$4"; MODEL="$5"; EFFORT="$6"; EXTRA="$7"
 log() { printf '%s [restart-driver] %s\n' "$(date '+%F %T')" "$*"; }
 fg()  { "$TMUX_BIN" display-message -p -t "$PANE" '#{pane_current_command}'; }
 mode_fix() {  # vim NORMAL mode → INSERT
@@ -179,10 +203,19 @@ for _ in $(seq 1 60); do              # wait for turn streaming to end (max 2 mi
   [ "$idle" -ge 3 ] && break
   sleep 2
 done
-# preserve permission mode: add the bypass flag only if it was on
+# preserve session state across the relaunch: pin the model + effort captured
+# at arm time (a bare --resume falls back to defaults — effort resets and the
+# changed system prompt breaks the warm prompt cache), keep the bypass flag
+# only if the footer showed it on, and append caller extras. An extra that
+# names --model/--effort itself replaces the pinned one (pin is dropped).
+case " $EXTRA" in *" --model"*)  MODEL=""  ;; esac
+case " $EXTRA" in *" --effort"*) EFFORT="" ;; esac
 FLAGS=""
-"$TMUX_BIN" capture-pane -p -t "$PANE" | grep -q 'bypass permissions on' && FLAGS=" --dangerously-skip-permissions"
-log "turn idle → sending /exit"
+[ -n "$MODEL" ]  && FLAGS="$FLAGS --model $MODEL"
+[ -n "$EFFORT" ] && FLAGS="$FLAGS --effort $EFFORT"
+"$TMUX_BIN" capture-pane -p -t "$PANE" | grep -q 'bypass permissions on' && FLAGS="$FLAGS --dangerously-skip-permissions"
+[ -n "$EXTRA" ]  && FLAGS="$FLAGS $EXTRA"
+log "turn idle → sending /exit (resume flags:${FLAGS:- none})"
 tui_type '/exit'
 for _ in $(seq 1 90); do case "$(fg)" in zsh|bash|fish|sh) break ;; esac; sleep 1; done
 case "$(fg)" in zsh|bash|fish|sh) ;; *) log "FAIL: claude did not exit (fg=$(fg))"; exit 1 ;; esac
@@ -199,9 +232,9 @@ tui_type '[cc-self restart driver] Automated restart sequence complete. Verify s
 log "wake-up message sent — driver done"
 DRV
     chmod +x "$DRIVER"
-    tmux run-shell -b "/bin/bash '$DRIVER' '$PANE' '$SID' '$CLAUDE_BIN' '$TMUX_BIN' >> '$LOG' 2>&1"
-    logit "restart: sid=$SID bin=$CLAUDE_BIN"
-    echo "restart driver armed — after this turn ends: /exit → resume (log: $LOG)"
+    tmux run-shell -b "/bin/bash '$DRIVER' '$PANE' '$SID' '$CLAUDE_BIN' '$TMUX_BIN' '$MODEL' '$EFFORT' '$EXTRA' >> '$LOG' 2>&1"
+    logit "restart: sid=$SID bin=$CLAUDE_BIN model=${MODEL:-?} effort=${EFFORT:-?}${EXTRA:+ extra=$EXTRA}"
+    echo "restart driver armed — after this turn ends: /exit → resume pinning model=${MODEL:-default} effort=${EFFORT:-default}${EXTRA:+ + $EXTRA} (log: $LOG)"
     ;;
   *)
     usage
