@@ -3,7 +3,7 @@ name: restart
 description: This skill should be used when the user asks to "restart your session", "restart yourself", "reload your session", or when the session itself determines a restart is needed (e.g. after a plugin update or harness change that requires a fresh process). Restarts the current Claude Code session in place via /exit + claude --resume, preserving the full conversation.
 argument-hint: "[session-id] [-- extra-resume-flags]"
 allowed-tools: Bash
-version: 1.1.0
+version: 1.1.1
 ---
 
 # Restart Own Session
@@ -52,6 +52,13 @@ resumed session reports back.
   system prompt would break the warm prompt cache. Setting effort via the TUI
   after resume is too late for the same reason — resume-time CLI args are the
   only cache-safe path.
+- Suffixed model variants are handled: transcripts record the bare API id, so
+  when settings names a suffixed form of the same model (e.g.
+  `claude-fable-5[1m]` for 1M context) the driver pins that form. All typed
+  flag values — pinned and `--` passthrough alike — are single-quoted when
+  typed, because the resume command lands in a live zsh where a bare `[1m]`
+  is a glob ("no matches found" and the relaunch never runs). Pass raw values
+  after `--`; the driver quotes each token itself.
 - The driver preserves permission mode: it adds `--dangerously-skip-permissions`
   only if the footer showed "bypass permissions on" before exiting.
 - It launches the real claude binary directly (aliases with extra flags

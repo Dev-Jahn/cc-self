@@ -172,14 +172,24 @@ WKR
     # (real JSON keys are unescaped there; quotes inside message text are
     # \"-escaped, so these greps can't match prose). Fallback: settings.json.
     TRANSCRIPT="$HOME/.claude/projects/$(pwd | sed 's|/|-|g')/$SID.jsonl"
+    if [ ! -f "$TRANSCRIPT" ]; then
+      # the session's cwd may have moved since launch — find the sid anywhere
+      # shellcheck disable=SC2012  # sid is a UUID; glob yields at most one clean path
+      TRANSCRIPT="$(ls "$HOME"/.claude/projects/*/"$SID".jsonl 2>/dev/null | head -1)"
+    fi
     MODEL=""; EFFORT=""
-    if [ -f "$TRANSCRIPT" ]; then
+    if [ -n "$TRANSCRIPT" ] && [ -f "$TRANSCRIPT" ]; then
       ALINE="$(grep '"type":"assistant"' "$TRANSCRIPT" | grep -v '"isSidechain":true' | grep '"effort":"' | tail -1)"
       MODEL="$(printf '%s' "$ALINE" | grep -o '"model":"[^"]*"' | head -1 | cut -d'"' -f4)"
       EFFORT="$(printf '%s' "$ALINE" | grep -o '"effort":"[a-z]*"' | head -1 | cut -d'"' -f4)"
     fi
     SETTINGS="$HOME/.claude/settings.json"
-    [ -n "$MODEL" ]  || MODEL="$(grep -o '"model"[[:space:]]*:[[:space:]]*"[^"]*"' "$SETTINGS" 2>/dev/null | head -1 | cut -d'"' -f4)"
+    SMODEL="$(grep -o '"model"[[:space:]]*:[[:space:]]*"[^"]*"' "$SETTINGS" 2>/dev/null | head -1 | cut -d'"' -f4)"
+    # transcripts record the bare API model id; settings may name a suffixed
+    # variant of the same model (e.g. claude-fable-5[1m] for 1M context).
+    # Adopt the suffixed form when the base matches so the mode survives.
+    if [ -n "$MODEL" ] && [ "${SMODEL%%\[*}" = "$MODEL" ]; then MODEL="$SMODEL"; fi
+    [ -n "$MODEL" ]  || MODEL="$SMODEL"
     [ -n "$EFFORT" ] || EFFORT="$(grep -o '"effortLevel"[[:space:]]*:[[:space:]]*"[^"]*"' "$SETTINGS" 2>/dev/null | head -1 | cut -d'"' -f4)"
     TMUX_BIN="$(command -v tmux)"
     DRIVER="$HOME/.cc-self-restart-driver.sh"
@@ -208,13 +218,19 @@ done
 # changed system prompt breaks the warm prompt cache), keep the bypass flag
 # only if the footer showed it on, and append caller extras. An extra that
 # names --model/--effort itself replaces the pinned one (pin is dropped).
+# Every typed value is single-quoted: the command lands in the pane's live
+# shell, where an unquoted claude-fable-5[1m] is a zsh glob ("no matches
+# found" — the relaunch never runs).
 case " $EXTRA" in *" --model"*)  MODEL=""  ;; esac
 case " $EXTRA" in *" --effort"*) EFFORT="" ;; esac
 FLAGS=""
-[ -n "$MODEL" ]  && FLAGS="$FLAGS --model $MODEL"
-[ -n "$EFFORT" ] && FLAGS="$FLAGS --effort $EFFORT"
+[ -n "$MODEL" ]  && FLAGS="$FLAGS --model '$MODEL'"
+[ -n "$EFFORT" ] && FLAGS="$FLAGS --effort '$EFFORT'"
 "$TMUX_BIN" capture-pane -p -t "$PANE" | grep -q 'bypass permissions on' && FLAGS="$FLAGS --dangerously-skip-permissions"
-[ -n "$EXTRA" ]  && FLAGS="$FLAGS $EXTRA"
+if [ -n "$EXTRA" ]; then
+  read -ra EXTRA_WORDS <<< "$EXTRA"
+  for w in "${EXTRA_WORDS[@]}"; do FLAGS="$FLAGS '$w'"; done
+fi
 log "turn idle → sending /exit (resume flags:${FLAGS:- none})"
 tui_type '/exit'
 for _ in $(seq 1 90); do case "$(fg)" in zsh|bash|fish|sh) break ;; esac; sleep 1; done
