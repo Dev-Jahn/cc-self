@@ -1,10 +1,16 @@
 {
   "name": "cc-self",
-  "version": "1.1.1",
+  "version": "1.1.2",
   "description": "Self-control for Claude Code sessions running in tmux: type slash commands into your own TUI, answer your own dialogs, observe your own screen, and restart yourself in place.",
   "author": {
     "name": "Dev-Jahn"
   },
   "license": "MIT",
-  "keywords": ["tmux", "self-control", "automation", "session", "restart"]
+  "keywords": [
+    "tmux",
+    "self-control",
+    "automation",
+    "session",
+    "restart"
+  ]
 }
