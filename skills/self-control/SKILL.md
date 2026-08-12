@@ -30,7 +30,7 @@ cleanly outside it. The table below abbreviates this as `cc-self`.
 | `cc-self pane` | Show target pane info |
 | `cc-self sid` | Print current session id |
 | `cc-self restart [sid]` | Restart own session (see cc-self:restart skill) |
-| `--pane %N` | Target another pane's session instead of self |
+| `--pane %N` | Target another pane's session instead of self — for operating that session's TUI on the user's behalf (peek, dialogs, slash commands). **Not a messaging channel**: never `type` content addressed to another session's model. Its input box submits under the USER's name (autofill can even pre-stage text you never sent), so a typed "message" becomes a forged user turn. Session-to-session delivery belongs to messaging tools (SendMessage, khala), not this one. |
 
 ## Core patterns
 
