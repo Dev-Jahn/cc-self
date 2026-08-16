@@ -233,7 +233,17 @@ if [ -n "$EXTRA" ]; then
 fi
 log "turn idle → sending /exit (resume flags:${FLAGS:- none})"
 tui_type '/exit'
-for _ in $(seq 1 90); do case "$(fg)" in zsh|bash|fish|sh) break ;; esac; sleep 1; done
+# /exit with live background tasks opens a "Background work is running"
+# confirm dialog instead of exiting — Enter takes the preselected
+# "Exit and stop tasks" (restart kills background work by contract).
+for _ in $(seq 1 90); do
+  case "$(fg)" in zsh|bash|fish|sh) break ;; esac
+  if "$TMUX_BIN" capture-pane -p -t "$PANE" | grep -q 'Background work is running'; then
+    log "background-work dialog → confirming (exit and stop tasks)"
+    "$TMUX_BIN" send-keys -t "$PANE" Enter
+  fi
+  sleep 1
+done
 case "$(fg)" in zsh|bash|fish|sh) ;; *) log "FAIL: claude did not exit (fg=$(fg))"; exit 1 ;; esac
 log "claude exited → relaunching (real binary, alias bypassed)"
 sleep 1
