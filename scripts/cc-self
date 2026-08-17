@@ -204,6 +204,31 @@ mode_fix() {  # vim NORMAL mode → INSERT
     && { "$TMUX_BIN" send-keys -t "$PANE" -l 'i'; sleep 0.3; }
 }
 tui_type() { mode_fix; "$TMUX_BIN" send-keys -t "$PANE" -l -- "$1"; sleep 0.5; "$TMUX_BIN" send-keys -t "$PANE" Enter; }
+# At idle the leading "/" opens the command palette, and characters that
+# arrive in the same input tick can be swallowed by its initialization
+# (observed live: only the trailing "t" of /exit survived and Enter
+# submitted it as a user message). Stage the command in two paced sends
+# and press Enter only after the input box visibly holds /exit.
+type_exit() {
+  for attempt in 1 2 3; do
+    mode_fix
+    "$TMUX_BIN" send-keys -t "$PANE" -l '/'
+    sleep 0.6
+    "$TMUX_BIN" send-keys -t "$PANE" -l 'exit'
+    sleep 0.6
+    if "$TMUX_BIN" capture-pane -p -t "$PANE" | tail -6 | grep -qE '[>❯] */exit'; then
+      "$TMUX_BIN" send-keys -t "$PANE" Enter
+      return 0
+    fi
+    log "stage attempt $attempt: /exit not in input box → clear and retry"
+    "$TMUX_BIN" send-keys -t "$PANE" Escape
+    sleep 0.3
+    for _ in $(seq 1 8); do "$TMUX_BIN" send-keys -t "$PANE" BSpace; done
+    sleep 0.5
+  done
+  log "FAIL: could not stage /exit after 3 attempts — aborting, session left intact"
+  return 1
+}
 
 log "start pane=$PANE sid=$SID"
 sleep 15                              # let the session finish its last message
@@ -232,7 +257,7 @@ if [ -n "$EXTRA" ]; then
   for w in "${EXTRA_WORDS[@]}"; do FLAGS="$FLAGS '$w'"; done
 fi
 log "turn idle → sending /exit (resume flags:${FLAGS:- none})"
-tui_type '/exit'
+type_exit || exit 1
 # /exit with live background tasks opens a "Background work is running"
 # confirm dialog instead of exiting — Enter takes the preselected
 # "Exit and stop tasks" (restart kills background work by contract).
