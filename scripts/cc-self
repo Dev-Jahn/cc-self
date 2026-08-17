@@ -216,7 +216,10 @@ type_exit() {
     sleep 0.6
     "$TMUX_BIN" send-keys -t "$PANE" -l 'exit'
     sleep 0.6
-    if "$TMUX_BIN" capture-pane -p -t "$PANE" | tail -6 | grep -qE '[>❯] */exit'; then
+    # capture-pane pads to full pane height with blank lines, so strip them
+    # before windowing; the TUI also renders a no-break space (C2 A0) after
+    # the ❯ prompt — normalize it to plain spaces before matching
+    if "$TMUX_BIN" capture-pane -p -t "$PANE" | sed '/^[[:space:]]*$/d' | tail -10 | tr '\302\240' '  ' | grep -qE '[>❯] */exit'; then
       "$TMUX_BIN" send-keys -t "$PANE" Enter
       return 0
     fi

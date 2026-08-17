@@ -11,7 +11,7 @@
       "category": "development",
       "homepage": "https://github.com/Dev-Jahn/cc-self",
       "keywords": ["tmux", "self-control", "automation", "session", "restart"],
-      "version": "1.1.4"
+      "version": "1.1.5"
     }
   ]
 }
