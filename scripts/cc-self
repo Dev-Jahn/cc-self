@@ -14,6 +14,10 @@
 #                                     (slash commands alone never re-invoke the
 #                                     model — chain -w to continue autonomously)
 #   cc-self type -n "text"            type without Enter (stage in input box)
+#   cc-self type --paste "text"       deliver via bracketed paste instead of
+#                                     keystrokes — REQUIRED for long text and
+#                                     slash commands with long arguments
+#   cc-self type --from-file <path>   paste a file's contents (implies --paste)
 #   cc-self key <name>                send one special key (Escape, C-u, Up...)
 #   cc-self clear                     empty the input box (backspace burst)
 #   cc-self peek [N]                  show last N lines of the pane (default 20)
@@ -33,6 +37,11 @@
 # notes:
 #  - `type` sends text only. Control keys must go through `key` — prevents
 #    accidentally interrupting the session's own turn (Escape) or killing it.
+#  - raw keystroke bursts mangle long input: the command palette opened by a
+#    leading "/" can swallow same-tick characters, and multibyte (IME) text
+#    drops under load — a 3.8KB /compact was observed live mangled into a
+#    plain-text message. --paste avoids all of it: the TUI receives a single
+#    bracketed-paste event, and the box is verified before Enter.
 #  - vim keybindings: when the pane shows `-- NORMAL --`, an `i` is sent
 #    first to enter INSERT mode (typing into NORMAL mode gets eaten as vim
 #    commands — "cc" is change-line).
@@ -44,7 +53,7 @@ set -u
 LOG="${CC_SELF_LOG:-$HOME/.cc-self.log}"
 PANE="${CC_SELF_PANE:-${TMUX_PANE:-}}"
 
-usage() { sed -n '5,30p' "$0" | sed 's/^# \{0,1\}//'; exit 1; }
+usage() { sed -n '5,34p' "$0" | sed 's/^# \{0,1\}//'; exit 1; }
 logit() { printf '%s pane=%s %s\n' "$(date '+%F %T')" "$PANE" "$*" >> "$LOG"; }
 
 resolve_sid() {
@@ -83,25 +92,76 @@ case "$CMD" in
     tmux capture-pane -p -t "$PANE" | sed -e :a -e '/^[[:space:]]*$/{$d;N;ba' -e '}' | tail -n "$N"
     ;;
   type)
-    NO_ENTER=0; WAKE=0
+    NO_ENTER=0; WAKE=0; PASTE=0; FROM=""
     while :; do
       case "${1:-}" in
         -n) NO_ENTER=1; shift ;;
         -w|--wake) WAKE=1; shift ;;
+        --paste) PASTE=1; shift ;;
+        --from-file)
+          [ -n "${2:-}" ] || { echo "cc-self type: --from-file needs a path"; exit 1; }
+          FROM="$2"; PASTE=1; shift 2 ;;
         *) break ;;
       esac
     done
-    [ $# -ge 1 ] || { echo "cc-self type: nothing to send"; exit 1; }
-    TEXT="$*"
-    send_line() {  # type one line, entering INSERT first if vim NORMAL mode
+    TEXT=""
+    if [ -n "$FROM" ]; then
+      [ -f "$FROM" ] || { echo "cc-self type: no such file: $FROM"; exit 1; }
+    else
+      [ $# -ge 1 ] || { echo "cc-self type: nothing to send"; exit 1; }
+      TEXT="$*"
+    fi
+    mode_fix() {  # vim NORMAL mode eats input as commands — enter INSERT first
       if tmux capture-pane -p -t "$PANE" | tail -6 | grep -qE -- '-- NORMAL --|\[NORMAL\]'; then
         tmux send-keys -t "$PANE" -l 'i'
         sleep 0.2
       fi
-      tmux send-keys -t "$PANE" -l -- "$1"
-      sleep 0.3   # let the TUI process input (autocomplete popup etc.)
     }
-    send_line "$TEXT"
+    if [ "$PASTE" -eq 1 ]; then
+      # Bracketed paste: the TUI receives the text as one paste event, so
+      # nothing is interpreted per-keystroke — no command-palette race on a
+      # leading "/", no multibyte drops in long bursts.
+      SRC="$FROM"; TMP=""
+      if [ -z "$SRC" ]; then
+        TMP="$(mktemp "${TMPDIR:-/tmp}/cc-self-paste.XXXXXX")"
+        printf '%s' "$TEXT" > "$TMP"
+        SRC="$TMP"
+      fi
+      BYTES="$(wc -c < "$SRC" | tr -d ' ')"
+      # the input-box line is the last one starting with ❯; the TUI pads a
+      # no-break space (C2 A0) after ❯ — normalize before matching
+      box() { tmux capture-pane -p -t "$PANE" | tr '\302\240' ' ' | grep '^❯' | tail -1 | sed 's/^❯ *//; s/ *$//'; }
+      mode_fix
+      tmux load-buffer -b cc-self-paste "$SRC"
+      OK=0; B=""
+      for _ in 1 2 3 4; do
+        tmux paste-buffer -p -b cc-self-paste -t "$PANE"
+        sleep 1
+        B="$(box)"
+        [ -z "$B" ] && continue          # nothing arrived → paste again
+        # a large paste collapses to "[Pasted text #N]"; submitting that sends
+        # plain text, not a slash command — pasting the same buffer again
+        # expands it to literal text (the TUI's "paste again to expand")
+        case "$B" in '[Pasted text #'*) continue ;; esac
+        OK=1; break
+      done
+      tmux delete-buffer -b cc-self-paste 2>/dev/null
+      [ -n "$TMP" ] && rm -f "$TMP"
+      if [ "$OK" -ne 1 ]; then
+        # abort without Enter and without clearing: on self-use the session's
+        # own turn is running, and Escape would interrupt it — peek, then
+        # recover deliberately (a collapsed placeholder deletes with BSpace)
+        logit "type (paste) FAIL: box did not reach literal state (box: ${B:-empty})"
+        echo "cc-self type: paste did not verify (box: ${B:-empty}) — nothing submitted; peek and recover" >&2
+        exit 1
+      fi
+      DESC="paste ${BYTES}B${FROM:+ from $FROM}"
+    else
+      mode_fix
+      tmux send-keys -t "$PANE" -l -- "$TEXT"
+      sleep 0.3   # let the TUI process input (autocomplete popup etc.)
+      DESC="$TEXT"
+    fi
     [ "$NO_ENTER" -eq 0 ] && tmux send-keys -t "$PANE" Enter
     if [ "$WAKE" -eq 1 ]; then
       # Slash commands execute locally and never start a model turn. A plain
@@ -133,10 +193,14 @@ sleep 0.5
 log "wake sent"
 WKR
       chmod +x "$WAKER"
-      tmux run-shell -b "/bin/bash '$WAKER' '$PANE' '$TEXT' '$TMUX_BIN' >> '$LOG' 2>&1"
+      # the waker re-types the note as raw keystrokes — for pastes, pass a
+      # short summary instead of the (possibly huge) text itself
+      NOTE="$TEXT"
+      [ "$PASTE" -eq 1 ] && NOTE="pasted input (${BYTES} bytes)"
+      tmux run-shell -b "/bin/bash '$WAKER' '$PANE' '$NOTE' '$TMUX_BIN' >> '$LOG' 2>&1"
     fi
-    logit "type$([ $NO_ENTER -eq 1 ] && echo ' (no-enter)')$([ $WAKE -eq 1 ] && echo ' (+wake)'): $TEXT"
-    echo "sent to $PANE: $TEXT$([ $NO_ENTER -eq 1 ] && echo ' (no Enter)')$([ $WAKE -eq 1 ] && echo ' (+wake queued)')"
+    logit "type$([ $NO_ENTER -eq 1 ] && echo ' (no-enter)')$([ $WAKE -eq 1 ] && echo ' (+wake)'): $DESC"
+    echo "sent to $PANE: $DESC$([ $NO_ENTER -eq 1 ] && echo ' (no Enter)')$([ $WAKE -eq 1 ] && echo ' (+wake queued)')"
     ;;
   key)
     [ $# -ge 1 ] || { echo "cc-self key: key name required (e.g. Escape, C-u, Up)"; exit 1; }

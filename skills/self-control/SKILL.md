@@ -1,7 +1,7 @@
 ---
 name: self-control
 description: This skill should be used when the session needs to perform a user-side action on its own Claude Code TUI — run a slash command on itself ("/reload-plugins", "/effort low", "/model", "/plugin install ..."), answer its own confirmation dialogs, observe its own screen, or when the user asks to "change your own effort", "reload plugins yourself", "install this plugin yourself", "control your own session", "type into your own TUI", or "restart your session" (for restart, prefer the cc-self:restart skill).
-version: 1.0.0
+version: 1.2.0
 ---
 
 # cc-self — Session Self-Control
@@ -24,6 +24,8 @@ cleanly outside it. The table below abbreviates this as `cc-self`.
 |---|---|
 | `cc-self type "/reload-plugins"` | Type text + Enter |
 | `cc-self type -n "text"` | Type without Enter (stage only) |
+| `cc-self type --paste "text"` | Deliver via bracketed paste — **required** for long text and slash commands with long arguments |
+| `cc-self type --from-file <path>` | Paste a file's contents (implies `--paste`) |
 | `cc-self key Enter` | Send one special key (Escape, Up, C-u, ...) |
 | `cc-self clear` | Empty the input box (backspace burst) |
 | `cc-self peek [N]` | Show last N lines of own screen (default 20) |
@@ -56,6 +58,22 @@ command can occasionally be dropped silently. For plugin/marketplace
 management prefer the headless CLI (`claude plugin install|update ...`,
 `claude plugin marketplace add ...`) and verify side effects on disk; reserve
 TUI typing for live-session-only commands (/effort, /model, /reload-plugins).
+
+**Slash command with long arguments (e.g. `/compact <instructions>`):**
+```bash
+printf '/compact ' > "$TMPDIR/cmd.txt"; cat instructions.md >> "$TMPDIR/cmd.txt"
+bash <plugin-root>/scripts/cc-self type -w --from-file "$TMPDIR/cmd.txt"
+```
+Never send long text as raw keystrokes: the command palette opened by the
+leading `/` can swallow same-tick characters, and multibyte (IME) text drops
+under load — a 3.8KB `/compact` was observed live mangled into `ㄱct`, which
+submitted the whole payload as a plain user message. `--paste` delivers a
+single bracketed-paste event instead. The script auto-expands the TUI's
+`[Pasted text #N]` placeholder (submitting the placeholder would send plain
+text, not a slash command) and presses Enter only after the input box
+verifiably holds literal text. On failure it aborts **without** pressing
+Enter — `peek`, then recover: a collapsed placeholder deletes with a single
+BSpace; do not send Escape mid-turn, it interrupts the session's own turn.
 
 **Handle a dialog — never press keys blind:**
 ```bash
