@@ -16,15 +16,23 @@ jobs:
         # `sh` default can never reinterpret bash-only syntax and fail the run.
         run: shellcheck -s bash scripts/cc-self
 
-      - name: shellcheck (embedded driver + waker)
-        # scripts/cc-self writes two helper scripts to disk at runtime as
+      - name: shellcheck (embedded drivers + waker)
+        # scripts/cc-self writes helper scripts to disk at runtime as
         # single-quoted heredocs; shellcheck does not lint inside heredocs, so
         # extract and lint them explicitly to keep the whole surface clean.
         run: |
           set -euo pipefail
-          sed -n "/cat > \"\$DRIVER\" <<'DRV'/,/^DRV$/p" scripts/cc-self | sed '1d;$d' > /tmp/drv.sh
-          sed -n "/cat > \"\$WAKER\" <<'WKR'/,/^WKR$/p"  scripts/cc-self | sed '1d;$d' > /tmp/wkr.sh
-          shellcheck -s bash /tmp/drv.sh /tmp/wkr.sh
+          sed -n "/cat > \"\$DRIVER\" <<'DRV'/,/^DRV$/p"   scripts/cc-self | sed '1d;$d' > /tmp/drv.sh
+          sed -n "/cat > \"\$WAKER\" <<'WKR'/,/^WKR$/p"    scripts/cc-self | sed '1d;$d' > /tmp/wkr.sh
+          sed -n "/cat > \"\$RDRIVER\" <<'RCV'/,/^RCV$/p"  scripts/cc-self | sed '1d;$d' > /tmp/rcv.sh
+          for f in /tmp/drv.sh /tmp/wkr.sh /tmp/rcv.sh; do test -s "$f" || { echo "::error::heredoc extraction empty: $f"; exit 1; }; done
+          shellcheck -s bash /tmp/drv.sh /tmp/wkr.sh /tmp/rcv.sh
+
+      - name: hook is valid (python + hooks.json)
+        run: |
+          set -euo pipefail
+          python3 -m py_compile hooks/model-guard.py
+          jq -e '.hooks.UserPromptSubmit and .hooks.PostToolUse' hooks/hooks.json
 
       - name: plugin manifest parses
         run: |

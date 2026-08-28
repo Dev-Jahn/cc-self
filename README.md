@@ -33,6 +33,20 @@ a process that survives its own death (used for restart).
   command (`--model`/`--effort`) so effort survives the restart and the
   prompt cache stays warm; `restart <sid> -- <flags>` appends extra resume
   flags verbatim (replacing the pinned ones they name, e.g. `-- --effort max`).
+- **`model-recovery` skill + `model-guard` hook + `cc-self recover`**:
+  deterministic recovery from model safety-fallbacks. The bundled hook
+  re-flags on every run while the session runs below the baseline declared in
+  `~/.claude/settings.json`, embedding the exact recovery step. The model's
+  only job is writing a compact instruction file (preserve context, abstract
+  the trigger content); `cc-self recover` then submits `/compact` and a
+  detached driver waits out the compaction, switches `/model` back, approves
+  the confirm dialog only after seeing it, verifies the statusline, and wakes
+  the session — a state machine with per-session state in
+  `~/.cc-self/state/recover-<sid>.json`, no blind keypress at any step.
+  Sessions with an always-blocking Stop hook integrate via the yield-valve
+  flag (`~/.cc-self/state/yield-<sid>`, see the model-recovery skill). If an
+  external copy of the guard also runs, keep only one enabled
+  (`~/.cc-self/state/guard-disabled` disables the bundled one).
 - **`scripts/cc-self`**: the underlying CLI, usable directly from Bash.
 
 ## Requirements

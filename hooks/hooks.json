@@ -1,0 +1,28 @@
+{
+  "description": "model-guard: re-flags on every run while the session runs below its declared baseline model, with the cc-self recover instruction embedded. Disable via ~/.cc-self/state/guard-disabled (keep only one guard enabled if an external copy also runs).",
+  "hooks": {
+    "UserPromptSubmit": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 \"${CLAUDE_PLUGIN_ROOT}/hooks/model-guard.py\"",
+            "timeout": 10
+          }
+        ]
+      }
+    ],
+    "PostToolUse": [
+      {
+        "matcher": "*",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 \"${CLAUDE_PLUGIN_ROOT}/hooks/model-guard.py\"",
+            "timeout": 10
+          }
+        ]
+      }
+    ]
+  }
+}

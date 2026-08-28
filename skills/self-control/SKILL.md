@@ -1,7 +1,7 @@
 ---
 name: self-control
 description: This skill should be used when the session needs to perform a user-side action on its own Claude Code TUI — run a slash command on itself ("/reload-plugins", "/effort low", "/model", "/plugin install ..."), answer its own confirmation dialogs, observe its own screen, or when the user asks to "change your own effort", "reload plugins yourself", "install this plugin yourself", "control your own session", "type into your own TUI", or "restart your session" (for restart, prefer the cc-self:restart skill).
-version: 1.2.0
+version: 1.3.0
 ---
 
 # cc-self — Session Self-Control
@@ -32,6 +32,7 @@ cleanly outside it. The table below abbreviates this as `cc-self`.
 | `cc-self pane` | Show target pane info |
 | `cc-self sid` | Print current session id |
 | `cc-self restart [sid]` | Restart own session (see cc-self:restart skill) |
+| `cc-self recover --compact-file <f> [--attempt N]` | Deterministic model-fallback recovery: submits `/compact`, then a detached driver switches `/model` back to the baseline and verifies (see cc-self:model-recovery skill) |
 | `--pane %N` | Target another pane's session instead of self — for operating that session's TUI on the user's behalf (peek, dialogs, slash commands). **Not a messaging channel**: never `type` content addressed to another session's model. Its input box submits under the USER's name (autofill can even pre-stage text you never sent), so a typed "message" becomes a forged user turn. Session-to-session delivery belongs to messaging tools (SendMessage, khala), not this one. |
 
 ## Core patterns
