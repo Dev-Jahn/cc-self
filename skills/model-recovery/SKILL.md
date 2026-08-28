@@ -1,7 +1,7 @@
 ---
 name: model-recovery
 description: This skill should be used when a "[model-guard]" note reports the session is running below its declared baseline model (e.g. "running as Opus 4.8, not the Fable 5 your system prompt declares"), when the user asks to "recover the model", "switch back to the baseline model", "restore Fable 5", or after a "[cc-self recover]" verification wake message arrives. Runs the deterministic compact-first recovery built into cc-self.
-version: 1.3.0
+version: 1.3.1
 ---
 
 # Model-Fallback Recovery (deterministic, compact-first)
@@ -26,9 +26,9 @@ order, mechanically.
 ## Your ONE job: write the compact instruction file
 
 Everything else — submitting `/compact`, waiting out the compaction, switching
-`/model` back, approving the confirm dialog only after seeing it, verifying
-the statusline, waking the session — is performed deterministically by a
-detached driver. Do not do any of those steps by hand.
+`/model` back, approving the confirm dialog only after seeing it, waking the
+session, and verifying the live model from the transcript — is performed
+deterministically by a detached driver. Do not do any of those steps by hand.
 
 Write a file (scratchpad is fine) containing **instructions only** — no
 `/compact` prefix (the script adds it), and prefer no double quotes (they are
@@ -71,6 +71,14 @@ ARMED → COMPACT_SUBMITTED → COMPACT_DONE → MODEL_DIALOG → SWITCHED
 The driver polls the screen (NBSP-normalized), times out per phase, and on
 any mismatch aborts with the failure phase recorded instead of pressing keys
 blind. Every send is logged to `~/.cc-self.log`.
+
+Post-switch verification reads the **session transcript** (`message.model` of
+the first assistant message after the wake) — the same truth source the guard
+hook uses. Statusline and toast checks are advisory logging only: statuslines
+are user-configurable and cannot be relied on. The `DONE` state's note records
+the outcome: `verified` (live model = baseline), `re-fell` (guard escalates
+with attempt+1 on the wake turn), or `inconclusive` (guard confirms next
+turn either way).
 
 ## The verification wake
 

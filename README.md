@@ -40,9 +40,10 @@ a process that survives its own death (used for restart).
   only job is writing a compact instruction file (preserve context, abstract
   the trigger content); `cc-self recover` then submits `/compact` and a
   detached driver waits out the compaction, switches `/model` back, approves
-  the confirm dialog only after seeing it, verifies the statusline, and wakes
-  the session — a state machine with per-session state in
-  `~/.cc-self/state/recover-<sid>.json`, no blind keypress at any step.
+  the confirm dialog only after seeing it, wakes the session, and verifies the
+  live model from the session transcript (statuslines are user-configurable,
+  so screen checks are advisory only) — a state machine with per-session state
+  in `~/.cc-self/state/recover-<sid>.json`, no blind keypress at any step.
   Sessions with an always-blocking Stop hook integrate via the yield-valve
   flag (`~/.cc-self/state/yield-<sid>`, see the model-recovery skill). If an
   external copy of the guard also runs, keep only one enabled

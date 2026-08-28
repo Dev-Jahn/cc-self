@@ -37,8 +37,8 @@
 #                                     a detached driver waits out the compaction,
 #                                     switches /model back to the baseline,
 #                                     approves the confirm dialog only after
-#                                     seeing it, verifies the statusline, and
-#                                     wakes the session to verify guard silence
+#                                     seeing it, wakes the session, and verifies
+#                                     the live model from the session transcript
 #
 # target pane priority: --pane <id> > $CC_SELF_PANE > $TMUX_PANE (self)
 # every send is logged to $CC_SELF_LOG (default ~/.cc-self.log)
@@ -262,9 +262,9 @@ WKR
     # switch does not hold while the trigger content is still in context).
     # The model's ONLY job is writing the compact instruction file; everything
     # else — submitting /compact, waiting out the compaction, switching /model
-    # back, approving the dialog after seeing it, verifying the statusline,
-    # waking the session — is done mechanically by a detached driver.
-    # See skills/model-recovery/SKILL.md.
+    # back, approving the dialog after seeing it, waking the session, and
+    # verifying the live model from the transcript — is done mechanically by a
+    # detached driver. See skills/model-recovery/SKILL.md.
     COMPACT_FILE=""; BASELINE=""; ATTEMPT=1
     while :; do
       case "${1:-}" in
@@ -291,6 +291,10 @@ WKR
     find "$STATE_DIR" -name 'recover-*.json' -mtime +7 -delete 2>/dev/null
     find "$STATE_DIR" -name 'yield-*' -mtime +1 -delete 2>/dev/null
     STATE="$STATE_DIR/recover-$SID.json"
+    # Truth source for post-switch verification: the session transcript records
+    # the ACTUAL model on every assistant message (same source the guard hook
+    # reads). Statuslines are user-configurable and cannot be relied on.
+    TRANSCRIPT="$HOME/.claude/projects/$(pwd | sed 's|/|-|g')/$SID.jsonl"
     rc_state() {  # rc_state <phase> [note] — note may quote screen content; keep the JSON valid
       local n; n="$(printf '%s' "${2:-}" | tr '\042\134' '\047 ')"
       printf '{"sid":"%s","pane":"%s","baseline":"%s","label":"%s","attempt":%s,"phase":"%s","note":"%s","ts":"%s"}\n' \
@@ -319,7 +323,10 @@ WKR
 # cc-self recover driver — runs detached under the tmux server.
 # Phases: ARMED → COMPACT_SUBMITTED → COMPACT_DONE → MODEL_DIALOG → SWITCHED
 #         → VERIFY_WAKE → DONE, or FAILED-<phase> (no blind keypress, ever).
-PANE="$1"; SID="$2"; BASELINE="$3"; LABEL="$4"; ATTEMPT="$5"; TMUX_BIN="$6"; STATE="$7"
+# Verification truth source: the session transcript (message.model), NOT the
+# statusline — statuslines are user-configurable; toast/label checks are
+# advisory logging only.
+PANE="$1"; SID="$2"; BASELINE="$3"; LABEL="$4"; ATTEMPT="$5"; TMUX_BIN="$6"; STATE="$7"; TRANSCRIPT="$8"
 STATE_DIR="$(dirname "$STATE")"; YIELD="$STATE_DIR/yield-$SID"
 log()  { printf '%s [recover-driver] %s\n' "$(date '+%F %T')" "$*"; }
 norm() { "$TMUX_BIN" capture-pane -p -t "$PANE" 2>/dev/null | tr '\302\240' ' '; }
@@ -336,6 +343,27 @@ alive() {  # pane must exist and still run the TUI (a plain shell = session gone
 }
 mode_fix() { norm | tail -6 | grep -qE -- '-- NORMAL --' && { "$TMUX_BIN" send-keys -t "$PANE" -l 'i'; sleep 0.3; }; }
 box() { norm | grep '^❯' | tail -1 | sed 's/^❯ *//; s/ *$//'; }
+live_model() {  # newest assistant model appended to the transcript after byte offset $1
+  python3 - "$TRANSCRIPT" "$1" <<'PY' 2>/dev/null
+import json, sys
+try:
+    f = open(sys.argv[1], 'rb'); f.seek(int(sys.argv[2])); data = f.read().decode('utf-8', 'ignore')
+except Exception:
+    sys.exit(0)
+out = ""
+for line in data.splitlines():
+    try:
+        d = json.loads(line)
+    except Exception:
+        continue
+    m = d.get("message", {})
+    if isinstance(m, dict) and m.get("role") == "assistant":
+        mod = m.get("model")
+        if mod and mod != "<synthetic>":
+            out = mod
+print(out)
+PY
+}
 
 log "armed pane=$PANE sid=$SID baseline=$BASELINE label=${LABEL:-(none)} attempt=$ATTEMPT"
 # yield-valve: a session whose Stop hook always blocks never goes idle, so the
@@ -405,35 +433,70 @@ if [ "$seen" -ne 2 ]; then
 fi
 "$TMUX_BIN" send-keys -t "$PANE" Enter
 
-# ---- verify the switch took: statusline label or confirmation toast -------
-# Bottom window only — post-compact conversation text may contain "[Label]".
-ok=0
-for _ in $(seq 1 30); do
-  s="$(norm | tail -8)"
-  if [ -n "$LABEL" ] && printf '%s\n' "$s" | grep -qF "[$LABEL]"; then ok=1; break; fi
-  printf '%s\n' "$s" | grep -q 'Set model to' && { ok=1; break; }
+# ---- confirm the Enter registered: the dialog must CLOSE ------------------
+# TUI signal, independent of any user statusline config. Typing into a still-
+# open dialog is dangerous (digits select options), so a dialog that never
+# closes is a hard failure, not something to type past.
+closed=0
+for _ in $(seq 1 15); do
+  norm | tail -12 | grep -qE '❯ *1\. Yes, switch to' || { closed=1; break; }
   sleep 1
 done
-[ "$ok" -eq 1 ] || fail SWITCHED "statusline/toast did not confirm the switch"
-set_state SWITCHED
-log "switched to $BASELINE"
+[ "$closed" -eq 1 ] || fail SWITCHED "dialog did not close after Enter"
+# Advisory only (user statuslines vary; the toast wording may change across
+# TUI versions): note whether a toast/label happened to confirm, never fail.
+adv="unconfirmed"
+for _ in $(seq 1 5); do
+  s="$(norm | tail -8)"
+  { [ -n "$LABEL" ] && printf '%s\n' "$s" | grep -qF "[$LABEL]"; } || printf '%s\n' "$s" | grep -q 'Set model to' \
+    && { adv="confirmed"; break; }
+  sleep 1
+done
+set_state SWITCHED "dialog approved+closed; toast/statusline advisory: $adv"
+log "dialog approved and closed (advisory: $adv)"
 
-# ---- wake the session so the guard hook can confirm the recovery held -----
+# ---- wake the session, then verify against the TRANSCRIPT (truth source) ---
+# The switch's real effect is the model of the NEXT turn. The transcript
+# records message.model on every assistant message — the same truth source the
+# guard hook reads, independent of any UI configuration.
 alive VERIFY_WAKE
+OFF0="$(wc -c < "$TRANSCRIPT" 2>/dev/null | tr -d ' ')"
+[ -n "$OFF0" ] || OFF0=0
 set_state VERIFY_WAKE
 sleep 2
 mode_fix
 "$TMUX_BIN" send-keys -t "$PANE" -l -- "[cc-self recover] attempt $ATTEMPT: model switched, verify guard silence and report"
 sleep 0.5
 "$TMUX_BIN" send-keys -t "$PANE" Enter
-set_state DONE
+BASE="${BASELINE%%\[*}"
+verdict=""
+for _ in $(seq 1 90); do   # up to 3 min for the wake turn's first assistant message
+  m="$(live_model "$OFF0")"
+  [ -n "$m" ] && { verdict="$m"; break; }
+  sleep 2
+done
 rm -f "$YIELD"
-log "done — verification wake sent"
+if [ -z "$verdict" ]; then
+  # Inconclusive (no new assistant message seen — transcript path off, python3
+  # missing, or a very slow first turn). NOT a failure: the guard hook reads
+  # the same truth on the wake turn and re-arms with attempt+1 if it re-fell.
+  set_state DONE "wake sent; transcript verification inconclusive — guard confirms next turn"
+  log "done — wake sent, transcript verification inconclusive"
+elif [ "$verdict" = "$BASE" ]; then
+  set_state DONE "verified: live model $verdict = baseline"
+  log "done — verified live model $verdict"
+else
+  # Switch did not take or the session re-fell immediately. Terminal DONE (the
+  # wake was sent); the guard sees the off-baseline transcript on that very
+  # turn and escalates with attempt+1 and a stronger-abstraction instruction.
+  set_state DONE "re-fell: live model $verdict != baseline $BASE — guard escalates"
+  log "done — but live model is $verdict, not $BASE (guard will escalate)"
+fi
 RCV
     chmod +x "$RDRIVER"
-    tmux run-shell -b "/bin/bash '$RDRIVER' '$PANE' '$SID' '$BASELINE' '$LABEL' '$ATTEMPT' '$TMUX_BIN' '$STATE' >> '$LOG' 2>&1"
+    tmux run-shell -b "/bin/bash '$RDRIVER' '$PANE' '$SID' '$BASELINE' '$LABEL' '$ATTEMPT' '$TMUX_BIN' '$STATE' '$TRANSCRIPT' >> '$LOG' 2>&1"
     logit "recover: armed sid=$SID baseline=$BASELINE label=${LABEL:-?} attempt=$ATTEMPT compact=${PASTE_BYTES}B"
-    echo "recover armed (attempt $ATTEMPT): /compact queued (${PASTE_BYTES}B) — end the turn now; driver: compaction → /model $BASELINE → dialog → verify → wake (state: $STATE, log: $LOG)"
+    echo "recover armed (attempt $ATTEMPT): /compact queued (${PASTE_BYTES}B) — end the turn now; driver: compaction → /model $BASELINE → dialog → wake → transcript-verify (state: $STATE, log: $LOG)"
     ;;
   restart)
     # The session's own death kills its Bash tool too, so the restart
