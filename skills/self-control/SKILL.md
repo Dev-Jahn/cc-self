@@ -1,7 +1,7 @@
 ---
 name: self-control
 description: This skill should be used when the session needs to perform a user-side action on its own Claude Code TUI — run a slash command on itself ("/reload-plugins", "/effort low", "/model", "/plugin install ..."), answer its own confirmation dialogs, observe its own screen, or when the user asks to "change your own effort", "reload plugins yourself", "install this plugin yourself", "control your own session", "type into your own TUI", or "restart your session" (for restart, prefer the cc-self:restart skill).
-version: 1.3.1
+version: 1.3.2
 ---
 
 # cc-self — Session Self-Control

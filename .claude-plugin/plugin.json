@@ -1,6 +1,6 @@
 {
   "name": "cc-self",
-  "version": "1.3.1",
+  "version": "1.3.2",
   "description": "Self-control for Claude Code sessions running in tmux: type slash commands into your own TUI, answer your own dialogs, observe your own screen, restart yourself in place, and recover deterministically from model fallbacks.",
   "author": {
     "name": "Dev-Jahn"

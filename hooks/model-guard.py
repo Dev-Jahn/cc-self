@@ -18,7 +18,9 @@ per-session (keyed by transcript id), so they never collide with an external
 guard's state kept elsewhere.
 
 Invoked as a Claude Code hook: reads hook JSON from stdin. Also runnable
-standalone with a transcript path argument for testing.
+standalone with a transcript path argument for testing — close stdin when you
+do (`python3 model-guard.py <transcript> < /dev/null`), or sys.stdin.read()
+blocks waiting for EOF.
 """
 import json
 import os
@@ -78,6 +80,7 @@ def model_label(model_id):
 
 
 def latest_model(transcript_path):
+    # Returns (model, record_epoch_or_None) of the newest assistant record.
     # The latest assistant turn is near the end, but a single huge tool_result
     # (e.g. a multi-thousand-line subagent report) can exceed a small tail
     # window and push the last assistant line out of view — which would make
@@ -86,14 +89,14 @@ def latest_model(transcript_path):
     try:
         size = os.path.getsize(transcript_path)
     except Exception:
-        return None
+        return None, None
     for back in (262_144, 2_097_152, 16_777_216):
         try:
             with open(transcript_path, "rb") as f:
                 f.seek(max(0, size - back))
                 chunk = f.read().decode("utf-8", "ignore")
         except Exception:
-            return None
+            return None, None
         for line in reversed(chunk.splitlines()):
             try:
                 d = json.loads(line)
@@ -103,10 +106,19 @@ def latest_model(transcript_path):
             if isinstance(m, dict) and m.get("role") == "assistant":
                 model = m.get("model")
                 if model and model != "<synthetic>":
-                    return model
+                    return model, record_epoch(d.get("timestamp"))
         if back >= size:
             break
-    return None
+    return None, None
+
+
+def record_epoch(ts):
+    # Transcript records stamp ISO8601 UTC ("2026-08-28T09:37:26.642Z").
+    try:
+        from datetime import datetime
+        return datetime.fromisoformat(str(ts).replace("Z", "+00:00")).timestamp()
+    except Exception:
+        return None
 
 
 def recover_state(key):
@@ -135,20 +147,46 @@ def save_last(path, model):
         pass
 
 
-def recovery_directive(rec, live_name, base_name):
+def recovery_directive(rec, live_name, base_name, live_ts=None):
     """The recovery instruction appended to every off-baseline note.
 
     The model's ONLY job is filling the compact template; `cc-self recover`
     does the rest deterministically (submit /compact, wait it out, switch
-    /model, approve the dialog after seeing it, verify, wake).
+    /model, approve the dialog after seeing it, wake, transcript-verify).
     """
     import time
     phase = (rec or {}).get("phase", "")
+    note = str((rec or {}).get("note", ""))
     attempt_prev = int((rec or {}).get("attempt", 0) or 0)
     attempt_next = attempt_prev + 1 if rec else 1
     fresh = rec and (time.time() - rec.get("_mtime", 0) < INFLIGHT_FRESH_SECS)
     inflight = ("ARMED", "COMPACT_SUBMITTED", "COMPACT_DONE", "MODEL_DIALOG")
     landed = ("SWITCHED", "VERIFY_WAKE", "DONE")
+
+    # Terminal: an operator explicitly closed this recovery (cc-self recover
+    # --close). State the fact, instruct nothing.
+    if phase == "CLOSED":
+        return (" Recovery was closed by operator decision (state CLOSED) — "
+                "not instructing a re-arm.")
+
+    # Stale-read protection (found live by clawd, 2026-08-28): on the first
+    # hook firings of the post-switch wake turn, the newest assistant record
+    # still predates the switch (UserPromptSubmit fires before the turn's
+    # first assistant message exists; transcript flush can lag a few tool
+    # calls more). Re-arming from that record nearly triggered a needless
+    # attempt 5 on a recovery that had in fact HELD. If the record is older
+    # than the recover state's last write, the off-baseline reading proves
+    # nothing about the current runtime — unless the driver itself saw a
+    # post-wake off-baseline record ("re-fell"), which IS post-switch truth.
+    if (phase in landed and fresh and live_ts is not None
+            and live_ts <= rec.get("_mtime", 0)
+            and not note.startswith("re-fell")):
+        return (" NOTE: this reading comes from a transcript record that "
+                f"predates the just-completed switch (recover attempt "
+                f"{attempt_prev} state {phase}: {note or 'no note'}) — it is "
+                "almost certainly STALE. Do NOT re-arm from this note alone; "
+                "a post-switch assistant record will settle it within a few "
+                "tool calls, and this guard falls silent if the recovery held.")
 
     if phase in inflight and fresh:
         return (f" A recovery attempt {attempt_prev} is already in flight "
@@ -196,7 +234,9 @@ def main():
     transcript = inp.get("transcript_path") or (sys.argv[1] if len(sys.argv) > 1 else None)
     event = inp.get("hook_event_name", "manual")
     # Prefer a model field if the harness ever provides one directly.
-    live = inp.get("model") or (latest_model(transcript) if transcript else None)
+    live, live_ts = inp.get("model"), None
+    if not live and transcript:
+        live, live_ts = latest_model(transcript)
     if not live:
         sys.exit(0)
 
@@ -242,7 +282,7 @@ def main():
                 f"(actual id: {live}), not the {base_name} your system prompt "
                 f"declares. A safety fallback switched you. Do not claim to be "
                 f"{base_name}.")
-    note += recovery_directive(recover_state(key), live_name, base_name)
+    note += recovery_directive(recover_state(key), live_name, base_name, live_ts)
 
     print(json.dumps({
         "hookSpecificOutput": {

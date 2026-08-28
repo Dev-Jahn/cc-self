@@ -31,6 +31,8 @@
 #                                     command verbatim and win over the pinned
 #                                     ones (e.g. -- --effort max)
 #   cc-self recover --compact-file <f> [--baseline <model>] [--attempt N]
+#   cc-self recover --close           close the recovery by operator decision
+#                                     (guard stops instructing re-arms)
 #                                     deterministic model-fallback recovery:
 #                                     wraps the file's instructions into
 #                                     /compact "...", pastes + submits it, then
@@ -62,7 +64,7 @@ set -u
 LOG="${CC_SELF_LOG:-$HOME/.cc-self.log}"
 PANE="${CC_SELF_PANE:-${TMUX_PANE:-}}"
 
-usage() { sed -n '5,43p' "$0" | sed 's/^# \{0,1\}//'; exit 1; }
+usage() { sed -n '5,45p' "$0" | sed 's/^# \{0,1\}//'; exit 1; }
 logit() { printf '%s pane=%s %s\n' "$(date '+%F %T')" "$PANE" "$*" >> "$LOG"; }
 
 resolve_sid() {
@@ -265,7 +267,7 @@ WKR
     # back, approving the dialog after seeing it, waking the session, and
     # verifying the live model from the transcript — is done mechanically by a
     # detached driver. See skills/model-recovery/SKILL.md.
-    COMPACT_FILE=""; BASELINE=""; ATTEMPT=1
+    COMPACT_FILE=""; BASELINE=""; ATTEMPT=1; CLOSE=0
     while :; do
       case "${1:-}" in
         --compact-file) [ -n "${2:-}" ] || { echo "cc-self recover: --compact-file needs a path"; exit 1; }
@@ -274,11 +276,12 @@ WKR
                         BASELINE="$2"; shift 2 ;;
         --attempt)      [ -n "${2:-}" ] || { echo "cc-self recover: --attempt needs a number"; exit 1; }
                         ATTEMPT="$2"; shift 2 ;;
+        --close)        CLOSE=1; shift ;;
         *) break ;;
       esac
     done
-    [ -n "$COMPACT_FILE" ] || { echo "cc-self recover: --compact-file <path> is required (instructions only — no /compact prefix)"; exit 1; }
-    [ -f "$COMPACT_FILE" ] || { echo "cc-self recover: no such file: $COMPACT_FILE"; exit 1; }
+    [ "$CLOSE" -eq 1 ] || [ -n "$COMPACT_FILE" ] || { echo "cc-self recover: --compact-file <path> is required (instructions only — no /compact prefix)"; exit 1; }
+    [ "$CLOSE" -eq 1 ] || [ -f "$COMPACT_FILE" ] || { echo "cc-self recover: no such file: $COMPACT_FILE"; exit 1; }
     case "$ATTEMPT" in ''|*[!0-9]*) echo "cc-self recover: --attempt must be a number"; exit 1 ;; esac
     [ -n "$BASELINE" ] || BASELINE="$(settings_model)"
     [ -n "$BASELINE" ] || { echo "cc-self recover: cannot resolve baseline (no --baseline, no model in settings.json)"; exit 1; }
@@ -300,6 +303,19 @@ WKR
       printf '{"sid":"%s","pane":"%s","baseline":"%s","label":"%s","attempt":%s,"phase":"%s","note":"%s","ts":"%s"}\n' \
         "$SID" "$PANE" "$BASELINE" "$LABEL" "$ATTEMPT" "$1" "$n" "$(date '+%FT%T%z')" > "$STATE.tmp" && mv "$STATE.tmp" "$STATE"
     }
+    if [ "$CLOSE" -eq 1 ]; then
+      # Terminal state by OPERATOR decision — the guard stops instructing
+      # re-arms for this session. The never-settle directive means this is the
+      # user's call, not the model's: only run --close on explicit user
+      # instruction to stop retrying.
+      OLD_ATTEMPT="$(grep -o '"attempt":[0-9]*' "$STATE" 2>/dev/null | head -1 | cut -d: -f2)"
+      ATTEMPT="${OLD_ATTEMPT:-0}"
+      rc_state CLOSED "closed by operator decision"
+      rm -f "$STATE_DIR/yield-$SID"
+      logit "recover: CLOSED by operator (sid=$SID attempt=$ATTEMPT)"
+      echo "recover closed (sid=$SID): guard will state the fallback but stop instructing re-arms"
+      exit 0
+    fi
     rc_state ARMED
     # Wrap the instructions into /compact "...". Double quotes inside the
     # instructions would fight the wrapping quotes — normalize to single.
@@ -480,7 +496,7 @@ if [ -z "$verdict" ]; then
   # Inconclusive (no new assistant message seen — transcript path off, python3
   # missing, or a very slow first turn). NOT a failure: the guard hook reads
   # the same truth on the wake turn and re-arms with attempt+1 if it re-fell.
-  set_state DONE "wake sent; transcript verification inconclusive — guard confirms next turn"
+  set_state DONE "wake sent; transcript verification inconclusive — cross-check a post-wake record before re-arming"
   log "done — wake sent, transcript verification inconclusive"
 elif [ "$verdict" = "$BASE" ]; then
   set_state DONE "verified: live model $verdict = baseline"
