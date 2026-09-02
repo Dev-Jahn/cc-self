@@ -1,7 +1,7 @@
 ---
 name: self-control
 description: This skill should be used when the session needs to perform a user-side action on its own Claude Code TUI — run a slash command on itself ("/reload-plugins", "/effort low", "/model", "/plugin install ..."), answer its own confirmation dialogs, observe its own screen, or when the user asks to "change your own effort", "reload plugins yourself", "install this plugin yourself", "control your own session", "type into your own TUI", or "restart your session" (for restart, prefer the cc-self:restart skill).
-version: 1.3.2
+version: 1.4.0
 ---
 
 # cc-self — Session Self-Control
@@ -31,8 +31,10 @@ cleanly outside it. The table below abbreviates this as `cc-self`.
 | `cc-self peek [N]` | Show last N lines of own screen (default 20) |
 | `cc-self pane` | Show target pane info |
 | `cc-self sid` | Print current session id |
+| `cc-self status` | Show the resolved session id and any driver in flight for it |
 | `cc-self restart [sid]` | Restart own session (see cc-self:restart skill) |
-| `cc-self recover --compact-file <f> [--attempt N]` | Deterministic model-fallback recovery: submits `/compact`, then a detached driver switches `/model` back to the baseline and verifies (see cc-self:model-recovery skill) |
+| `cc-self recover --compact-file <f> [--attempt N]` | Deterministic model-fallback recovery: submits `/compact`, then a detached driver switches `/model` back to the baseline and verifies (see cc-self:model-recovery skill). One driver per session — a second arm is refused while it lives |
+| `--sid <id>` | Name the target session explicitly (default: own session from the environment; for `--pane` targets, the newest transcript of that pane's cwd) |
 | `--pane %N` | Target another pane's session instead of self — for operating that session's TUI on the user's behalf (peek, dialogs, slash commands). **Not a messaging channel**: never `type` content addressed to another session's model. Its input box submits under the USER's name (autofill can even pre-stage text you never sent), so a typed "message" becomes a forged user turn. Session-to-session delivery belongs to messaging tools (SendMessage, khala), not this one. |
 
 ## Core patterns
@@ -76,6 +78,11 @@ verifiably holds literal text. On failure it aborts **without** pressing
 Enter — `peek`, then recover: a collapsed placeholder deletes with a single
 BSpace; do not send Escape mid-turn, it interrupts the session's own turn.
 
+**While a driver is in flight** (`cc-self status` says so, or a
+`[model-guard]` note does), do not type slash commands or wake messages by
+hand — the driver owns the input box and improvised keystrokes race it.
+`type` prints a warning in that case but still sends.
+
 **Handle a dialog — never press keys blind:**
 ```bash
 cc-self type "/effort low"   # opens confirm dialog immediately
@@ -91,9 +98,11 @@ Check it after any state-changing command.
 
 ## Caveats
 
-- **vim keybindings**: handled automatically — when the pane shows
-  `-- NORMAL --`, the script sends `i` first. Typing into NORMAL mode gets
-  eaten as vim commands ("cc" is change-line).
+- **vim keybindings**: handled automatically — the TUI shows `-- INSERT --`
+  but nothing for NORMAL, so with `editorMode: vim` the script treats "no
+  indicator" as NORMAL and sends `i` first. Typing into NORMAL mode gets
+  eaten as vim commands ("cc" is change-line; a leading "Reply wi…" was
+  observed swallowed live).
 - **Effort/model switches invalidate the conversation cache** — the full
   history is re-read on the next message. Do not toggle casually.
 - **Guardrails**: `type` refuses nothing but sends text only; control keys go

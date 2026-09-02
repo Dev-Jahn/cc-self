@@ -3,7 +3,7 @@ name: restart
 description: This skill should be used when the user asks to "restart your session", "restart yourself", "reload your session", or when the session itself determines a restart is needed (e.g. after a plugin update or harness change that requires a fresh process). Restarts the current Claude Code session in place via /exit + claude --resume, preserving the full conversation.
 argument-hint: "[session-id] [-- extra-resume-flags]"
 allowed-tools: Bash
-version: 1.1.5
+version: 1.4.0
 ---
 
 # Restart Own Session
@@ -67,9 +67,15 @@ resumed session reports back.
   background work before arming — anything still running is stopped.
 - `/exit` is staged, not typed blind: at idle the leading `/` opens the
   command palette, which can swallow same-tick characters (a live incident
-  submitted the stray remainder as a fake user message). The driver paces
-  the send and presses Enter only after the input box visibly holds `/exit`;
-  if staging fails three times it aborts with the session left intact.
+  submitted the stray remainder as a fake user message). The driver pastes
+  it and presses Enter only after the input box visibly holds `/exit`; if
+  staging fails three times it aborts with the session left intact.
+- Turn-end detection does not depend on TUI wording: the driver waits until
+  the conversation area stops changing (up to 30 min) and no dialog is up.
+- One driver per session: `restart` refuses to arm while a recover or restart
+  driver is alive for the session (`--force` supersedes it). State is in
+  `~/.cc-self/state/restart-<sid>.json`; drivers always exit 0 (tmux would
+  echo a non-zero exit as a view-mode overlay on the focused pane).
 - It launches the real claude binary directly (aliases with extra flags
   would silently change session state).
 - If the restart stalls, inspect `~/.cc-self.log` — every driver phase is

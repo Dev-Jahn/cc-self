@@ -16,17 +16,18 @@ jobs:
         # `sh` default can never reinterpret bash-only syntax and fail the run.
         run: shellcheck -s bash scripts/cc-self
 
-      - name: shellcheck (embedded drivers + waker)
+      - name: shellcheck (embedded drivers + waker + shared lib)
         # scripts/cc-self writes helper scripts to disk at runtime as
         # single-quoted heredocs; shellcheck does not lint inside heredocs, so
         # extract and lint them explicitly to keep the whole surface clean.
         run: |
           set -euo pipefail
-          sed -n "/cat > \"\$DRIVER\" <<'DRV'/,/^DRV$/p"   scripts/cc-self | sed '1d;$d' > /tmp/drv.sh
-          sed -n "/cat > \"\$WAKER\" <<'WKR'/,/^WKR$/p"    scripts/cc-self | sed '1d;$d' > /tmp/wkr.sh
-          sed -n "/cat > \"\$RDRIVER\" <<'RCV'/,/^RCV$/p"  scripts/cc-self | sed '1d;$d' > /tmp/rcv.sh
-          for f in /tmp/drv.sh /tmp/wkr.sh /tmp/rcv.sh; do test -s "$f" || { echo "::error::heredoc extraction empty: $f"; exit 1; }; done
-          shellcheck -s bash /tmp/drv.sh /tmp/wkr.sh /tmp/rcv.sh
+          sed -n "/cat > \"\$DRIVER.tmp\" <<'DRV'/,/^DRV$/p"   scripts/cc-self | sed '1d;$d' > /tmp/drv.sh
+          sed -n "/cat > \"\$WAKER.tmp\" <<'WKR'/,/^WKR$/p"    scripts/cc-self | sed '1d;$d' > /tmp/wkr.sh
+          sed -n "/cat > \"\$RDRIVER.tmp\" <<'RCV'/,/^RCV$/p"  scripts/cc-self | sed '1d;$d' > /tmp/rcv.sh
+          sed -n "/cat > \"\$LIB.tmp\" <<'LIB'/,/^LIB$/p"  scripts/cc-self | sed '1d;$d' > /tmp/lib.sh
+          for f in /tmp/drv.sh /tmp/wkr.sh /tmp/rcv.sh /tmp/lib.sh; do test -s "$f" || { echo "::error::heredoc extraction empty: $f"; exit 1; }; done
+          shellcheck -s bash /tmp/drv.sh /tmp/wkr.sh /tmp/rcv.sh /tmp/lib.sh
 
       - name: hook is valid (python + hooks.json)
         run: |

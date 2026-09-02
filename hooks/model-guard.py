@@ -31,6 +31,9 @@ PLUGIN_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 SETTINGS = os.path.expanduser("~/.claude/settings.json")
 STATE_DIR = os.path.expanduser("~/.cc-self/state")
 DISABLE_FLAG = os.path.join(STATE_DIR, "guard-disabled")
+# Per-process opt-out (e.g. a scratch session driven by cc-self's own tests):
+# launch claude with CC_SELF_GUARD_DISABLED=1 — hooks inherit its environment.
+DISABLE_ENV = "CC_SELF_GUARD_DISABLED"
 
 # How long an in-flight recover state stays trusted before it is considered
 # stale (driver crashed / pane died) and a re-arm is instructed instead.
@@ -102,6 +105,8 @@ def latest_model(transcript_path):
                 d = json.loads(line)
             except Exception:
                 continue
+            if d.get("isSidechain"):
+                continue   # subagents may legitimately run on other models
             m = d.get("message", {})
             if isinstance(m, dict) and m.get("role") == "assistant":
                 model = m.get("model")
@@ -132,6 +137,27 @@ def recover_state(key):
         return None
 
 
+def driver_alive(rec):
+    """True while the driver that wrote this state is still running (it
+    records its pid on its first write; a pid-less ARMED state is the short
+    window before the driver starts)."""
+    try:
+        pid = int((rec or {}).get("pid", 0) or 0)
+    except Exception:
+        pid = 0
+    if pid <= 0:
+        return False
+    try:
+        os.kill(pid, 0)
+        return True
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    except Exception:
+        return False
+
+
 def load_last(path):
     try:
         return open(path).read().strip() or None
@@ -159,8 +185,13 @@ def recovery_directive(rec, live_name, base_name, live_ts=None):
     note = str((rec or {}).get("note", ""))
     attempt_prev = int((rec or {}).get("attempt", 0) or 0)
     attempt_next = attempt_prev + 1 if rec else 1
-    fresh = rec and (time.time() - rec.get("_mtime", 0) < INFLIGHT_FRESH_SECS)
-    inflight = ("ARMED", "COMPACT_SUBMITTED", "COMPACT_DONE", "MODEL_DIALOG")
+    alive = driver_alive(rec)
+    # A pid-less state is the short window between arming and the driver's
+    # first write (or a CLI that died before detaching): trust it briefly.
+    window = INFLIGHT_FRESH_SECS if int((rec or {}).get("pid", 0) or 0) > 0 else 120
+    fresh = rec and (alive or time.time() - rec.get("_mtime", 0) < window)
+    inflight = ("ARMED", "COMPACT_SUBMITTED", "COMPACT_DONE",
+                "SWITCH_SUBMITTED", "MODEL_DIALOG")
     landed = ("SWITCHED", "VERIFY_WAKE", "DONE")
 
     # Terminal: an operator explicitly closed this recovery (cc-self recover
@@ -190,8 +221,15 @@ def recovery_directive(rec, live_name, base_name, live_ts=None):
 
     if phase in inflight and fresh:
         return (f" A recovery attempt {attempt_prev} is already in flight "
-                f"(phase {phase}) — do not re-arm; end the turn and let the "
-                f"driver finish.")
+                f"(phase {phase}{', driver alive' if alive else ''}) — do NOT "
+                f"re-arm, do NOT type /compact, /model or any wake yourself; "
+                f"end the turn and let the driver finish (cc-self refuses a "
+                f"second arm while the driver lives).")
+    if phase in landed and alive:
+        return (f" Recovery attempt {attempt_prev} is completing (phase "
+                f"{phase}, driver alive) — do not re-arm yet; the driver "
+                f"verifies the switch from the transcript and this guard "
+                f"settles it on the next records.")
 
     parts = []
     if phase in landed:
@@ -204,7 +242,9 @@ def recovery_directive(rec, live_name, base_name, live_ts=None):
     elif phase.startswith("FAILED-") or (phase in inflight and not fresh):
         parts.append(
             f" A prior recovery attempt {attempt_prev} did not complete "
-            f"(state {phase or 'stale'}); check ~/.cc-self.log, then re-arm.")
+            f"(state {phase or 'stale'}: {note or 'no note'}); see "
+            f"`cc-self recover --status` and ~/.cc-self.log for the cause, "
+            f"then re-arm.")
     parts.append(
         f" Recover now (attempt {attempt_next}), per the cc-self "
         f"model-recovery skill: write a compact instruction file — preserve "
@@ -222,7 +262,7 @@ def recovery_directive(rec, live_name, base_name, live_ts=None):
 
 
 def main():
-    if os.path.exists(DISABLE_FLAG):
+    if os.path.exists(DISABLE_FLAG) or os.environ.get(DISABLE_ENV):
         sys.exit(0)
     raw = sys.stdin.read() if not sys.stdin.isatty() else ""
     inp = {}
@@ -233,9 +273,10 @@ def main():
             inp = {}
     transcript = inp.get("transcript_path") or (sys.argv[1] if len(sys.argv) > 1 else None)
     event = inp.get("hook_event_name", "manual")
-    # Prefer a model field if the harness ever provides one directly.
-    live, live_ts = inp.get("model"), None
-    if not live and transcript:
+    # Transcript truth only: the hook input's `model` (SessionStart) is the
+    # CONFIGURED model, not what the API actually answered with.
+    live, live_ts = (None, None)
+    if transcript:
         live, live_ts = latest_model(transcript)
     if not live:
         sys.exit(0)
@@ -272,15 +313,24 @@ def main():
 
     live_name = model_label(live)
     base_name = model_label(baseline_full)
+    # Facts only: the live model comes from the transcript, the baseline from
+    # settings.json. Claims about what the system prompt says are avoided —
+    # a session deliberately launched with --model <other> has a system
+    # prompt that names that model, and an inaccurate note gets (rightly)
+    # dismissed wholesale.
     if changed:
         prev_name = model_label(last)
         note = (f"[model-guard] Runtime model changed: {prev_name} → {live_name} "
-                f"(actual id: {live}). Your system prompt still declares {base_name}; "
-                f"that is stale. You are now running as {live_name}.")
+                f"(actual id: {live}). Configured baseline "
+                f"(~/.claude/settings.json model): {base_name} ({baseline_full}). "
+                f"You are now running as {live_name} — do not claim to be "
+                f"{base_name}.")
     else:
-        note = (f"[model-guard] You are actually running as {live_name} "
-                f"(actual id: {live}), not the {base_name} your system prompt "
-                f"declares. A safety fallback switched you. Do not claim to be "
+        note = (f"[model-guard] You are running as {live_name} (actual id: "
+                f"{live}); the configured baseline (~/.claude/settings.json "
+                f"model) is {base_name} ({baseline_full}). Unless the user "
+                f"deliberately started this session on {live_name} (an explicit "
+                f"--model), a safety fallback switched you. Do not claim to be "
                 f"{base_name}.")
     note += recovery_directive(recover_state(key), live_name, base_name, live_ts)
 

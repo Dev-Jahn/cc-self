@@ -23,6 +23,7 @@
 #   cc-self peek [N]                  show last N lines of the pane (default 20)
 #   cc-self pane                      show target pane info
 #   cc-self sid                       print current session id
+#   cc-self status                    show in-flight drivers + recover state
 #   cc-self restart [sid] [-- flags]  restart own session (delegates a driver
 #                                     to the tmux server: waits for turn end,
 #                                     /exit, claude --resume with the session's
@@ -30,19 +31,26 @@
 #                                     flags after -- are appended to the resume
 #                                     command verbatim and win over the pinned
 #                                     ones (e.g. -- --effort max)
-#   cc-self recover --compact-file <f> [--baseline <model>] [--attempt N]
+#   cc-self recover --compact-file <f> [--baseline <model>] [--attempt N] [--force]
+#   cc-self recover --status          show the recovery state machine
 #   cc-self recover --close           close the recovery by operator decision
 #                                     (guard stops instructing re-arms)
 #                                     deterministic model-fallback recovery:
 #                                     wraps the file's instructions into
 #                                     /compact "...", pastes + submits it, then
-#                                     a detached driver waits out the compaction,
-#                                     switches /model back to the baseline,
-#                                     approves the confirm dialog only after
-#                                     seeing it, wakes the session, and verifies
-#                                     the live model from the session transcript
+#                                     a detached driver waits out the compaction
+#                                     (transcript truth), switches /model back
+#                                     to the baseline (confirm dialog approved
+#                                     only if one appears — post-compaction
+#                                     switches are dialog-free), wakes the
+#                                     session, and verifies the live model from
+#                                     the session transcript. One driver per
+#                                     session: re-arming while one is alive is
+#                                     refused (--force supersedes it).
 #
 # target pane priority: --pane <id> > $CC_SELF_PANE > $TMUX_PANE (self)
+# session id priority:  --sid <id> > $CLAUDE_CODE_SESSION_ID/$CLAUDE_SESSION_ID
+#                       (self pane only) > newest transcript for the pane's cwd
 # every send is logged to $CC_SELF_LOG (default ~/.cc-self.log)
 #
 # notes:
@@ -58,58 +66,91 @@
 #    commands — "cc" is change-line).
 #  - slash commands with arguments execute immediately even mid-turn and may
 #    open confirmation dialogs: peek first, then `key Enter` deliberately.
+#  - detached helpers (drivers, wakers) run under the tmux server via
+#    `run-shell -b`. tmux echoes a non-zero exit of such a job as a view-mode
+#    overlay on whichever pane currently has FOCUS ("'…' returned 1" floating
+#    over an unrelated pane), and it expands #{…}/#(…) formats inside the
+#    command string. So: helpers always exit 0 (failures are recorded in the
+#    log and the per-session state file), every value on that command line is
+#    shell-quoted with '#' doubled, and payload text travels by file.
 # ============================================================================
 set -u
 
 LOG="${CC_SELF_LOG:-$HOME/.cc-self.log}"
 PANE="${CC_SELF_PANE:-${TMUX_PANE:-}}"
+SELF_PANE="${TMUX_PANE:-}"
+STATE_DIR="$HOME/.cc-self/state"
+LIB="$HOME/.cc-self/lib.sh"
+SID_OVERRIDE=""
 
-usage() { sed -n '5,45p' "$0" | sed 's/^# \{0,1\}//'; exit 1; }
+usage() { awk 'NR>=5 && /^# =+$/ {exit} NR>=5' "$0" | sed 's/^# \{0,1\}//'; exit 1; }
 logit() { printf '%s pane=%s %s\n' "$(date '+%F %T')" "$PANE" "$*" >> "$LOG"; }
 
+# ---- quoting for detached jobs ---------------------------------------------
+# tmux run-shell hands its argument to /bin/sh -c AFTER expanding tmux formats
+# (#{…} substitutes, #(…) RUNS a command, ## is a literal #). Every value that
+# reaches that string is single-quoted for sh AND has its '#' doubled; payload
+# text (wake notes, compact instructions) never rides that command line at
+# all — it travels by file.
+shq()   { printf "'%s'" "$(printf '%s' "$1" | sed "s/'/'\\\\''/g")"; }
+tmuxq() { printf '%s' "$1" | sed 's/#/##/g'; }
+# detach <sh-command built with shq>: run it detached under the tmux server,
+# output to the log, exit status swallowed (a non-zero status would be echoed
+# by tmux as a view-mode overlay on the focused pane).
+detach() { tmux run-shell -b "$(tmuxq "$1 >> $(shq "$LOG") 2>&1 || true")"; }
+
+# ---- session / transcript resolution ---------------------------------------
+is_self()  { [ -n "$SELF_PANE" ] && [ "$PANE" = "$SELF_PANE" ]; }
+enc_path() { printf '%s' "$1" | sed 's/[^A-Za-z0-9]/-/g'; }   # Claude Code's project-dir encoding
+pane_cwd() { tmux display-message -p -t "$PANE" '#{pane_current_path}' 2>/dev/null; }
 resolve_sid() {
-  if [ -n "${CLAUDE_SESSION_ID:-}" ]; then printf '%s' "$CLAUDE_SESSION_ID"; return; fi
-  local d
-  d="$HOME/.claude/projects/$(pwd | sed 's|/|-|g')"
+  if [ -n "$SID_OVERRIDE" ]; then printf '%s' "$SID_OVERRIDE"; return; fi
+  if is_self; then   # env names OUR session; for a foreign pane it would be wrong
+    local e="${CLAUDE_CODE_SESSION_ID:-${CLAUDE_SESSION_ID:-}}"
+    [ -n "$e" ] && { printf '%s' "$e"; return; }
+  fi
+  local cwd d
+  cwd="$(pane_cwd)"; [ -n "$cwd" ] || cwd="$(pwd)"
+  d="$HOME/.claude/projects/$(enc_path "$cwd")"
   # shellcheck disable=SC2012  # transcript filenames are UUIDs (no spaces/newlines); ls -t sorts by mtime cleanly
   ls -t "$d"/*.jsonl 2>/dev/null | head -1 | sed -E 's|.*/||; s|\.jsonl$||'
 }
-
-mode_fix() {  # vim NORMAL mode eats input as commands — enter INSERT first
-  if tmux capture-pane -p -t "$PANE" | tail -6 | grep -qE -- '-- NORMAL --|\[NORMAL\]'; then
-    tmux send-keys -t "$PANE" -l 'i'
-    sleep 0.2
-  fi
+find_transcript() {  # find_transcript <sid> — the pane's cwd project first, then anywhere
+  local cwd p
+  cwd="$(pane_cwd)"; [ -n "$cwd" ] || cwd="$(pwd)"
+  p="$HOME/.claude/projects/$(enc_path "$cwd")/$1.jsonl"
+  [ -f "$p" ] && { printf '%s' "$p"; return; }
+  # shellcheck disable=SC2012  # sid is a UUID; glob yields at most one clean path
+  ls "$HOME"/.claude/projects/*/"$1".jsonl 2>/dev/null | head -1
 }
 
-# the input-box line is the last one starting with ❯; the TUI pads a
-# no-break space (C2 A0) after ❯ — normalize before matching
-input_box() { tmux capture-pane -p -t "$PANE" | tr '\302\240' ' ' | grep '^❯' | tail -1 | sed 's/^❯ *//; s/ *$//'; }
-
-# paste_stage <file>: bracketed-paste a file's contents into the input box and
-# verify the box verifiably holds literal text. Does NOT press Enter — the
-# caller decides. Sets PASTE_BYTES / PASTE_BOX. Returns 1 without submitting
-# anything on failure (never Escape: on self-use the session's own turn is
-# running and Escape would interrupt it).
-paste_stage() {
-  local src="$1" ok=0
-  PASTE_BYTES="$(wc -c < "$src" | tr -d ' ')"
-  PASTE_BOX=""
-  mode_fix
-  tmux load-buffer -b cc-self-paste "$src"
-  for _ in 1 2 3 4; do
-    tmux paste-buffer -p -b cc-self-paste -t "$PANE"
-    sleep 1
-    PASTE_BOX="$(input_box)"
-    [ -z "$PASTE_BOX" ] && continue      # nothing arrived → paste again
-    # a large paste collapses to "[Pasted text #N]"; submitting that sends
-    # plain text, not a slash command — pasting the same buffer again
-    # expands it to literal text (the TUI's "paste again to expand")
-    case "$PASTE_BOX" in '[Pasted text #'*) continue ;; esac
-    ok=1; break
+# ---- state files -----------------------------------------------------------
+# Strictly per-session, keyed by sid: recover-<sid>.json / restart-<sid>.json
+# (single-line JSON written by us; read back with greps, no parser needed).
+jstr() { grep -o "\"$2\":\"[^\"]*\"" "$1" 2>/dev/null | head -1 | cut -d'"' -f4; }
+jnum() { grep -o "\"$2\":[0-9]*" "$1" 2>/dev/null | head -1 | cut -d: -f2; }
+job_alive() { case "${1:-}" in ''|0) return 1 ;; esac; kill -0 "$1" 2>/dev/null; }
+# inflight_driver <sid> → prints "<kind> <phase> <pid>" and returns 0 if a live
+# driver owns this session (recover or restart). A driver records its pid on
+# its first state write; a pid-less ARMED state is trusted for one minute
+# (the window between arming and the driver's start).
+inflight_driver() {
+  local f kind phase pid
+  for kind in recover restart; do
+    f="$STATE_DIR/$kind-$1.json"; [ -f "$f" ] || continue
+    phase="$(jstr "$f" phase)"; pid="$(jnum "$f" pid)"
+    case "$phase" in ''|DONE|CLOSED|FAILED-*) continue ;; esac
+    if job_alive "$pid"; then printf '%s %s %s\n' "$kind" "$phase" "$pid"; return 0; fi
+    if [ -z "$pid" ] && [ -n "$(find "$f" -mmin -1 2>/dev/null)" ]; then printf '%s %s -\n' "$kind" "$phase"; return 0; fi
   done
-  tmux delete-buffer -b cc-self-paste 2>/dev/null
-  [ "$ok" -eq 1 ]
+  return 1
+}
+gc_state() {  # age-based GC: states of long-gone sessions, stale yield flags
+  mkdir -p "$STATE_DIR"
+  find "$STATE_DIR" -name 'recover-*.json' -mtime +7 -delete 2>/dev/null
+  find "$STATE_DIR" -name 'restart-*.json' -mtime +7 -delete 2>/dev/null
+  find "$STATE_DIR" -name 'recover-*-screen.txt' -mtime +7 -delete 2>/dev/null
+  find "$STATE_DIR" -name 'yield-*' -mtime +1 -delete 2>/dev/null
 }
 
 settings_model() {  # the declared baseline model, e.g. claude-fable-5[1m]
@@ -133,11 +174,219 @@ model_label() {
   printf '%s\n' "$m" | awk '{for(i=1;i<=NF;i++){$i=toupper(substr($i,1,1)) substr($i,2)}}1'
 }
 
-# parse --pane anywhere in the arg list
+# ---- shared TUI library ----------------------------------------------------
+# One implementation of screen reading, paste-staging, idle detection and
+# transcript reading, used by this CLI AND by every detached helper (which
+# source it). Rewritten on every run so helpers always get the current copy.
+write_lib() {
+  mkdir -p "$(dirname "$LIB")"
+  cat > "$LIB.tmp" <<'LIB'
+#!/bin/bash
+# cc-self shared library — generated by scripts/cc-self, do not edit.
+# Requires PANE and TMUX_BIN in the environment of the sourcing script. An
+# EMPTY tmux target (-t '') silently means the CURRENT pane, so an unset PANE
+# must never reach a send: refuse to load instead.
+[ -n "${PANE:-}" ] && [ -n "${TMUX_BIN:-}" ] || { echo "cc-self lib: PANE/TMUX_BIN unset — refusing to load" >&2; return 1; }
+log()  { printf '%s [%s] %s\n' "$(date '+%F %T')" "${LOGTAG:-cc-self}" "$*"; }
+# the TUI pads a no-break space (C2 A0) after the ❯ prompt — normalize it.
+# sed, not tr: GNU tr (and BSD tr in the C locale a tmux server usually
+# runs in) is byte-wise and would also mangle every other C2/A0 byte ("·",
+# "©", some Korean syllables). Fails only when the pane cannot be captured.
+NBSP="$(printf '\302\240')"
+norm() { local out; out="$("$TMUX_BIN" capture-pane -p -t "$PANE" 2>/dev/null)" || return 1; printf '%s\n' "$out" | sed "s/$NBSP/ /g"; }
+fg()   { "$TMUX_BIN" display-message -p -t "$PANE" '#{pane_current_command}' 2>/dev/null; }
+pane_pid() { "$TMUX_BIN" display-message -p -t "$PANE" '#{pane_pid}' 2>/dev/null; }
+# Is a Claude Code process running in the pane's process tree? pane_current_
+# command is NOT a reliable signal: a non-interactive wrapper shell (bash -c
+# "claude; …", broker scripts) keeps the tty's process group, so tmux reports
+# "bash" while the TUI is alive. Walk the tree from pane_pid instead and look
+# for an executable named claude (symlink, versioned binary, or node cli).
+tui_alive() {
+  local root; root="$(pane_pid)"; [ -n "$root" ] || return 1
+  ps -A -o pid=,ppid=,args= 2>/dev/null | awk -v root="$root" '
+    { n=split($0, a, " "); par[a[1]]=a[2]; exe[a[1]]=(n>=3?a[3]:""); arg[a[1]]=(n>=4?a[4]:"") }
+    END {
+      q[0]=root; seen[root]=1; head=0; tail=1; found=0
+      while (head<tail) {
+        p=q[head++]; e=exe[p]; sub(/.*\//, "", e); ar=arg[p]
+        # the executable itself is claude (symlink or versioned binary), or a
+        # node/bun runtime whose script is the claude CLI — not any process
+        # that merely mentions "claude" in an argument (cat ~/.claude/…)
+        if (e == "claude" || exe[p] ~ /\/claude\/versions\// ||
+            ((e ~ /^(node|bun)/) && (ar ~ /(^|\/)claude$|claude-code|\/cli\.js$/))) found=1
+        for (c in par) if (par[c]==p && !seen[c]) { seen[c]=1; q[tail++]=c }
+      }
+      exit found ? 0 : 1 }'
+}
+# The input box is the ❯ line framed by horizontal rules (a bare ❯ line
+# elsewhere is an ECHOED user message or queued command in the conversation
+# area, e.g. "❯ /compact …"). box_line prints the framed line (first visual
+# line only when the text wraps); on an unframed TUI it falls back to the
+# last ❯ line.
+box_line() {
+  norm | awk 'prev ~ /^─/ && $0 ~ /^❯/ {b=$0; f=1} $0 ~ /^❯/ {l=$0} {prev=$0} END{print (f ? b : l)}'
+}
+box()     { box_line | sed 's/^❯ *//; s/ *$//'; }
+has_box() { [ -n "$(box_line)" ]; }
+# an INDENTED highlighted option (" ❯ 1. Yes, switch to …", " ❯ No, exit") =
+# some dialog/menu is up (confirm dialogs, permission prompts, pickers); the
+# input box and echoed messages sit at column 0. Dialogs REPLACE the framed
+# input box, so an indented ❯ while the box is on screen is just a tool
+# result echoing one (a `cc-self peek` output). Never type into a dialog.
+dialog_open() { ! has_box && norm | tail -30 | grep -qE '^ +❯ '; }
+# vim keybindings: NORMAL mode eats input as commands ("cc" is change-line,
+# a leading "Reply wi…" was observed swallowed live) — enter INSERT first.
+# The TUI shows "-- INSERT --" / "-- VISUAL --" but NOTHING for NORMAL, so
+# with vim mode on, "no indicator" means NORMAL — unless the user hid the
+# indicator, in which case the mode is unknowable and callers rely on the
+# staged-text verification (stage_exact clears and retries a mismatch).
+vim_on() {
+  [ -n "${VIM_ON:-}" ] || {
+    VIM_ON=0
+    grep -qE '"editorMode"[[:space:]]*:[[:space:]]*"vim"' "$HOME/.claude/settings.json" 2>/dev/null && VIM_ON=1
+    grep -qE '"hideVimModeIndicator"[[:space:]]*:[[:space:]]*true' "$HOME/.claude/settings.json" 2>/dev/null && VIM_ON=2
+  }
+  [ "$VIM_ON" -eq 1 ]
+}
+mode_fix() {
+  local t; t="$(norm | tail -6)"
+  case "$t" in *'-- NORMAL --'*) "$TMUX_BIN" send-keys -t "$PANE" -l 'i'; sleep 0.3; return ;; esac
+  vim_on || return 0
+  case "$t" in *'-- INSERT --'*|*'-- VISUAL --'*) return 0 ;; esac
+  "$TMUX_BIN" send-keys -t "$PANE" -l 'i'; sleep 0.3
+}
+clear_box() { mode_fix; "$TMUX_BIN" send-keys -N 120 -t "$PANE" BSpace; sleep 0.5; }
+# Busy detection. Known busy wordings (TUI versions vary — 2.1.258's spinner
+# carries no "esc to interrupt" hint at all) are backed by a wording-free
+# signal: a running turn animates its spinner glyph and elapsed counter every
+# second, so the conversation area (everything above the input box) changes
+# between polls. The bottom window is tail -15 on purpose: conversation text
+# higher up may legitimately contain these words.
+busy_text() {  # only the last lines of the conversation area: the spinner/status line lives there, tool results echoing these words sit higher
+  convo | sed '/^[[:space:]]*$/d' | tail -4 | grep -qE 'to interrupt|Compacting|Running (PreCompact|PostCompact|SessionStart) hooks|… \([0-9]+(m [0-9]+)?s ·'
+}
+convo() {  # everything above the input box (the whole screen when no box is framed)
+  norm | awk '{l[NR]=$0; if (prev ~ /^─/ && $0 ~ /^❯/) top=NR-1; prev=$0} END{n=(top?top:NR); for(i=1;i<=n;i++) print l[i]}'
+}
+# wait_idle <max-seconds> → 0 idle, 1 timeout, 2 pane/TUI gone.
+# idle = input box on screen, no dialog up, no busy text, and the
+# conversation area unchanged across 3 polls two seconds apart.
+wait_idle() {
+  local deadline=$(( $(date +%s) + $1 )) prev="" cur stable=0
+  while [ "$(date +%s)" -lt "$deadline" ]; do
+    norm >/dev/null || return 2
+    tui_alive || return 2
+    cur="$(convo)"
+    if busy_text || dialog_open || ! has_box || [ "$cur" != "$prev" ]; then stable=0; else stable=$((stable+1)); fi
+    prev="$cur"
+    [ "$stable" -ge 3 ] && return 0
+    sleep 2
+  done
+  return 1
+}
+# paste_stage <file>: bracketed-paste a file's contents into the input box and
+# verify the box verifiably holds literal text. Does NOT press Enter — the
+# caller decides. Sets PASTE_BYTES / PASTE_BOX. Returns 1 without submitting
+# anything on failure (never Escape: on self-use the session's own turn may
+# be running and Escape would interrupt it).
+paste_stage() {
+  local src="$1" ok=0
+  # shellcheck disable=SC2034  # read by callers after sourcing
+  PASTE_BYTES="$(wc -c < "$src" | tr -d ' ')"
+  PASTE_BOX=""
+  mode_fix
+  "$TMUX_BIN" load-buffer -b cc-self-paste "$src"
+  for _ in 1 2 3 4; do
+    "$TMUX_BIN" paste-buffer -p -b cc-self-paste -t "$PANE"
+    # a multi-KB paste can take the TUI a moment to render: look for up to
+    # 4 s before concluding nothing arrived (a blind re-paste would submit
+    # the text twice in one message)
+    PASTE_BOX=""
+    for _ in 1 2 3 4 5 6 7 8; do sleep 0.5; PASTE_BOX="$(box)"; [ -n "$PASTE_BOX" ] && break; done
+    [ -z "$PASTE_BOX" ] && continue      # nothing arrived → paste again
+    # a large paste collapses to "[Pasted text #N]"; submitting that sends
+    # plain text, not a slash command — pasting the same buffer again
+    # expands it to literal text (the TUI's "paste again to expand")
+    case "$PASTE_BOX" in '[Pasted text #'*) continue ;; esac
+    ok=1; break
+  done
+  "$TMUX_BIN" delete-buffer -b cc-self-paste 2>/dev/null
+  [ "$ok" -eq 1 ]
+}
+# stage_exact <text>: paste + verify the box holds exactly this text (its
+# first visual line when it wraps). IDLE ONLY — clears the box between tries.
+stage_exact() {
+  local want="$1" f i
+  for i in 1 2 3; do
+    f="$(mktemp "${TMPDIR:-/tmp}/cc-self-stage.XXXXXX")"
+    printf '%s' "$want" > "$f"
+    paste_stage "$f"; rm -f "$f"
+    if [ -n "$PASTE_BOX" ]; then case "$want" in "$PASTE_BOX"*) return 0 ;; esac; fi
+    log "stage try $i: box holds '${PASTE_BOX:-}' — clearing and retrying"
+    clear_box
+  done
+  return 1
+}
+# submit <staged-text>: Enter, then confirm the staged text LEFT the box (an
+# Enter can be swallowed by an autocomplete popup — retry once, never more).
+# "Left the box" rather than "box empty": mid-turn the TUI queues the message
+# and shows a placeholder hint ("Press up to edit queued messages"), and at
+# idle it may show a dim suggestion — neither is typed text.
+box_holds() { local b; b="$(box)"; [ -n "$b" ] && case "$1" in "$b"*) return 0 ;; esac; return 1; }
+submit() {
+  local want="$1" i
+  for i in 1 2; do
+    "$TMUX_BIN" send-keys -t "$PANE" Enter
+    sleep 1.5
+    box_holds "$want" || return 0
+    log "Enter did not submit (box still holds '$(box)') — retry $i"
+  done
+  ! box_holds "$want"
+}
+# tx_after <transcript> <byte-offset> <model|compact>: transcript truth.
+#   model   → newest main-chain assistant model recorded after the offset
+#   compact → "1" once a compact_boundary record (or the compact summary)
+#             appears after the offset
+tx_after() {
+  [ -n "${PY_BIN:-}" ] || PY_BIN="$(command -v python3 2>/dev/null)"
+  [ -n "$PY_BIN" ] || return 0
+  "$PY_BIN" - "$1" "$2" "$3" <<'PY' 2>/dev/null
+import json, sys
+path, off, mode = sys.argv[1], int(sys.argv[2]), sys.argv[3]
+try:
+    f = open(path, 'rb'); f.seek(off); data = f.read().decode('utf-8', 'ignore')
+except Exception:
+    sys.exit(0)
+out = ""
+for line in data.splitlines():
+    try:
+        d = json.loads(line)
+    except Exception:
+        continue
+    if mode == "compact":
+        if (d.get("type") == "system" and d.get("subtype") == "compact_boundary") or d.get("isCompactSummary"):
+            out = "1"
+        continue
+    if d.get("isSidechain"):
+        continue
+    m = d.get("message", {})
+    if isinstance(m, dict) and m.get("role") == "assistant":
+        mod = m.get("model")
+        if mod and mod != "<synthetic>":
+            out = mod
+print(out)
+PY
+}
+LIB
+  mv "$LIB.tmp" "$LIB"
+}
+
+# parse global options anywhere in the arg list
 ARGS=()
 while [ $# -gt 0 ]; do
   case "$1" in
-    --pane) PANE="$2"; shift 2 ;;
+    --pane) [ -n "${2:-}" ] || { echo "cc-self: --pane needs a pane id"; exit 1; }; PANE="$2"; shift 2 ;;
+    --sid)  [ -n "${2:-}" ] || { echo "cc-self: --sid needs a session id"; exit 1; }; SID_OVERRIDE="$2"; shift 2 ;;
     *) ARGS+=("$1"); shift ;;
   esac
 done
@@ -150,15 +399,37 @@ case "$CMD" in sid) resolve_sid; echo; exit 0 ;; esac
 
 [ -n "$PANE" ] || { echo "cc-self: cannot determine target pane (not inside tmux?)"; exit 1; }
 tmux has-session 2>/dev/null || { echo "cc-self: no tmux server"; exit 1; }
+TMUX_BIN="$(command -v tmux)"
+PY_BIN="$(command -v python3 2>/dev/null || true)"
+write_lib
+# shellcheck disable=SC1090  # generated above
+. "$LIB"
+gc_state
+
+warn_inflight() {  # manual TUI input can race a running driver — say so, don't block
+  local sid d
+  sid="$(resolve_sid)"; [ -n "$sid" ] || return 0
+  d="$(inflight_driver "$sid")" || return 0
+  echo "cc-self: warning — a ${d%% *} driver is in flight for this session (${d#* }); manual TUI input may race it" >&2
+}
 
 case "$CMD" in
   pane)
     tmux display-message -p -t "$PANE" \
-      '#{pane_id} #{session_name}:#{window_index}.#{pane_index} cmd=#{pane_current_command} title=#{pane_title}'
+      '#{pane_id} #{session_name}:#{window_index}.#{pane_index} cmd=#{pane_current_command} title=#{pane_title} path=#{pane_current_path}'
     ;;
   peek)
     N="${1:-20}"
     tmux capture-pane -p -t "$PANE" | sed -e :a -e '/^[[:space:]]*$/{$d;N;ba' -e '}' | tail -n "$N"
+    ;;
+  status)
+    SID="$(resolve_sid)"
+    echo "pane=$PANE sid=${SID:-?} self=$(is_self && echo yes || echo no)"
+    if d="$(inflight_driver "${SID:-none}")"; then echo "in flight: $d"; else echo "in flight: none"; fi
+    for k in recover restart; do
+      f="$STATE_DIR/$k-${SID:-none}.json"; [ -f "$f" ] && { printf '%s: ' "$k"; cat "$f"; }
+    done
+    exit 0
     ;;
   type)
     NO_ENTER=0; WAKE=0; PASTE=0; FROM=""
@@ -180,6 +451,7 @@ case "$CMD" in
       [ $# -ge 1 ] || { echo "cc-self type: nothing to send"; exit 1; }
       TEXT="$*"
     fi
+    warn_inflight
     if [ "$PASTE" -eq 1 ]; then
       # Bracketed paste: the TUI receives the text as one paste event, so
       # nothing is interpreted per-keystroke — no command-palette race on a
@@ -215,35 +487,42 @@ case "$CMD" in
       # queued plain text into the RUNNING turn while slash commands stay
       # queued — the wake would be consumed before the command runs. So the
       # wake is typed by a detached waker (tmux server process) that waits for
-      # the turn to end and queued commands to drain first.
-      TMUX_BIN="$(command -v tmux)"
+      # the turn to end and queued commands to drain first. The note travels
+      # by file: it is user text and must never ride a shell command line.
       WAKER="$HOME/.cc-self-waker.sh"
-      cat > "$WAKER" <<'WKR'
+      cat > "$WAKER.tmp" <<'WKR'
 #!/bin/bash
-PANE="$1"; NOTE="$2"; TMUX_BIN="$3"
-log() { printf '%s [waker] %s\n' "$(date '+%F %T')" "$*"; }
+# cc-self waker — runs detached under the tmux server. Always exits 0.
+PANE="$1"; NOTE_FILE="$2"; TMUX_BIN="$3"; LIB="$4"
+[ -n "$PANE" ] && [ -n "$TMUX_BIN" ] && [ -f "$LIB" ] || { echo "cc-self waker: missing PANE/TMUX_BIN/LIB — refusing to run" >&2; exit 0; }
+export PANE TMUX_BIN LOGTAG=waker
+# shellcheck disable=SC1090  # generated by scripts/cc-self
+. "$LIB" || exit 0
+NOTE="$(head -c 300 "$NOTE_FILE" 2>/dev/null | tr '\n' ' ')"; rm -f "$NOTE_FILE"
 log "armed pane=$PANE"
 sleep 5
-idle=0
-for _ in $(seq 1 90); do   # wait for the running turn to end (max 3 min)
-  if "$TMUX_BIN" capture-pane -p -t "$PANE" | grep -q 'to interrupt'; then idle=0; else idle=$((idle+1)); fi
-  [ "$idle" -ge 3 ] && break
-  sleep 2
-done
-sleep 2                    # let queued slash commands drain
-"$TMUX_BIN" capture-pane -p -t "$PANE" | tail -6 | grep -qE -- '-- NORMAL --' \
-  && { "$TMUX_BIN" send-keys -t "$PANE" -l 'i'; sleep 0.3; }
-"$TMUX_BIN" send-keys -t "$PANE" -l -- "[cc-self wake] continue after: $NOTE"
-sleep 0.5
-"$TMUX_BIN" send-keys -t "$PANE" Enter
-log "wake sent"
+# wait for the running turn to end and queued commands (possibly a whole
+# compaction) to drain — up to 30 min, as long as the TUI is alive
+wait_idle 1800; rc=$?
+case "$rc" in
+  1) log "turn still busy after 30 min — wake not sent"; exit 0 ;;
+  2) log "pane/TUI gone — wake not sent"; exit 0 ;;
+esac
+sleep 2
+WAKE="[cc-self wake] continue after: $NOTE"
+if stage_exact "$WAKE" && submit "$WAKE"; then
+  log "wake sent"
+else
+  log "wake could not be staged/submitted (box: '$(box)')"
+fi
+exit 0
 WKR
-      chmod +x "$WAKER"
-      # the waker re-types the note as raw keystrokes — for pastes, pass a
-      # short summary instead of the (possibly huge) text itself
+      chmod +x "$WAKER.tmp" && mv "$WAKER.tmp" "$WAKER"   # never rewrite a helper in place
       NOTE="$TEXT"
       [ "$PASTE" -eq 1 ] && NOTE="pasted input (${BYTES} bytes)"
-      tmux run-shell -b "/bin/bash '$WAKER' '$PANE' '$NOTE' '$TMUX_BIN' >> '$LOG' 2>&1"
+      NOTE_FILE="$(mktemp "${TMPDIR:-/tmp}/cc-self-note.XXXXXX")"
+      printf '%s' "$NOTE" > "$NOTE_FILE"
+      detach "/bin/bash $(shq "$WAKER") $(shq "$PANE") $(shq "$NOTE_FILE") $(shq "$TMUX_BIN") $(shq "$LIB")"
     fi
     logit "type$([ $NO_ENTER -eq 1 ] && echo ' (no-enter)')$([ $WAKE -eq 1 ] && echo ' (+wake)'): $DESC"
     echo "sent to $PANE: $DESC$([ $NO_ENTER -eq 1 ] && echo ' (no Enter)')$([ $WAKE -eq 1 ] && echo ' (+wake queued)')"
@@ -255,7 +534,7 @@ WKR
     echo "sent key to $PANE: $1"
     ;;
   clear)
-    tmux send-keys -N 80 -t "$PANE" BSpace
+    clear_box
     logit "clear"
     echo "cleared input of $PANE"
     ;;
@@ -264,10 +543,10 @@ WKR
     # switch does not hold while the trigger content is still in context).
     # The model's ONLY job is writing the compact instruction file; everything
     # else — submitting /compact, waiting out the compaction, switching /model
-    # back, approving the dialog after seeing it, waking the session, and
-    # verifying the live model from the transcript — is done mechanically by a
-    # detached driver. See skills/model-recovery/SKILL.md.
-    COMPACT_FILE=""; BASELINE=""; ATTEMPT=1; CLOSE=0
+    # back, approving a dialog if (and only if) one appears, waking the
+    # session, and verifying the live model from the transcript — is done
+    # mechanically by a detached driver. See skills/model-recovery/SKILL.md.
+    COMPACT_FILE=""; BASELINE=""; ATTEMPT=1; CLOSE=0; STATUS=0; FORCE=0
     while :; do
       case "${1:-}" in
         --compact-file) [ -n "${2:-}" ] || { echo "cc-self recover: --compact-file needs a path"; exit 1; }
@@ -277,38 +556,41 @@ WKR
         --attempt)      [ -n "${2:-}" ] || { echo "cc-self recover: --attempt needs a number"; exit 1; }
                         ATTEMPT="$2"; shift 2 ;;
         --close)        CLOSE=1; shift ;;
+        --status)       STATUS=1; shift ;;
+        --force)        FORCE=1; shift ;;
         *) break ;;
       esac
     done
+    SID="$(resolve_sid)"
+    [ -n "$SID" ] || { echo "cc-self recover: cannot resolve session id (pass --sid)"; exit 1; }
+    STATE="$STATE_DIR/recover-$SID.json"
+    if [ "$STATUS" -eq 1 ]; then
+      if [ -f "$STATE" ]; then cat "$STATE"; else echo "no recover state for sid=$SID"; fi
+      if d="$(inflight_driver "$SID")"; then echo "driver: in flight ($d)"; else echo "driver: none alive"; fi
+      exit 0
+    fi
     [ "$CLOSE" -eq 1 ] || [ -n "$COMPACT_FILE" ] || { echo "cc-self recover: --compact-file <path> is required (instructions only — no /compact prefix)"; exit 1; }
     [ "$CLOSE" -eq 1 ] || [ -f "$COMPACT_FILE" ] || { echo "cc-self recover: no such file: $COMPACT_FILE"; exit 1; }
     case "$ATTEMPT" in ''|*[!0-9]*) echo "cc-self recover: --attempt must be a number"; exit 1 ;; esac
     [ -n "$BASELINE" ] || BASELINE="$(settings_model)"
     [ -n "$BASELINE" ] || { echo "cc-self recover: cannot resolve baseline (no --baseline, no model in settings.json)"; exit 1; }
     LABEL="$(model_label "$BASELINE")"
-    SID="$(resolve_sid)"
-    [ -n "$SID" ] || { echo "cc-self recover: cannot resolve session id"; exit 1; }
-    STATE_DIR="$HOME/.cc-self/state"     # state is strictly PER-SESSION (keyed by sid)
-    mkdir -p "$STATE_DIR"
-    # age-based GC: recover states of long-gone sessions, stale yield flags
-    find "$STATE_DIR" -name 'recover-*.json' -mtime +7 -delete 2>/dev/null
-    find "$STATE_DIR" -name 'yield-*' -mtime +1 -delete 2>/dev/null
-    STATE="$STATE_DIR/recover-$SID.json"
-    # Truth source for post-switch verification: the session transcript records
-    # the ACTUAL model on every assistant message (same source the guard hook
-    # reads). Statuslines are user-configurable and cannot be relied on.
-    TRANSCRIPT="$HOME/.claude/projects/$(pwd | sed 's|/|-|g')/$SID.jsonl"
+    # Truth source for compaction + post-switch verification: the session
+    # transcript (compact_boundary records; message.model on every assistant
+    # message — the same source the guard hook reads). Statuslines are
+    # user-configurable and cannot be relied on.
+    TRANSCRIPT="$(find_transcript "$SID")"
     rc_state() {  # rc_state <phase> [note] — note may quote screen content; keep the JSON valid
-      local n; n="$(printf '%s' "${2:-}" | tr '\042\134' '\047 ')"
-      printf '{"sid":"%s","pane":"%s","baseline":"%s","label":"%s","attempt":%s,"phase":"%s","note":"%s","ts":"%s"}\n' \
-        "$SID" "$PANE" "$BASELINE" "$LABEL" "$ATTEMPT" "$1" "$n" "$(date '+%FT%T%z')" > "$STATE.tmp" && mv "$STATE.tmp" "$STATE"
+      local n; n="$(printf '%s' "${2:-}" | tr '\042\134\n' '\047  ')"
+      printf '{"sid":"%s","pane":"%s","baseline":"%s","label":"%s","attempt":%s,"phase":"%s","note":"%s","pid":0,"ts":"%s"}\n' \
+        "$SID" "$PANE" "$BASELINE" "$LABEL" "$ATTEMPT" "$1" "$n" "$(date '+%FT%T%z')" > "$STATE.$$.tmp" && mv "$STATE.$$.tmp" "$STATE"
     }
     if [ "$CLOSE" -eq 1 ]; then
       # Terminal state by OPERATOR decision — the guard stops instructing
-      # re-arms for this session. The never-settle directive means this is the
-      # user's call, not the model's: only run --close on explicit user
-      # instruction to stop retrying.
-      OLD_ATTEMPT="$(grep -o '"attempt":[0-9]*' "$STATE" 2>/dev/null | head -1 | cut -d: -f2)"
+      # re-arms for this session and a live driver stops at its next step.
+      # The never-settle directive means this is the user's call, not the
+      # model's: only run --close on explicit user instruction.
+      OLD_ATTEMPT="$(jnum "$STATE" attempt)"
       ATTEMPT="${OLD_ATTEMPT:-0}"
       rc_state CLOSED "closed by operator decision"
       rm -f "$STATE_DIR/yield-$SID"
@@ -316,6 +598,21 @@ WKR
       echo "recover closed (sid=$SID): guard will state the fallback but stop instructing re-arms"
       exit 0
     fi
+    [ -n "$TRANSCRIPT" ] && [ -f "$TRANSCRIPT" ] || { echo "cc-self recover: no transcript found for sid=$SID (wrong session? pass --sid)"; exit 1; }
+    [ -n "$PY_BIN" ] || echo "cc-self recover: warning — python3 not found; compaction/verification fall back to screen signals only" >&2
+    # One driver per session. Re-arming on top of a live driver makes two
+    # processes race on the same input box; refuse unless told to supersede.
+    if d="$(inflight_driver "$SID")"; then
+      if [ "$FORCE" -eq 1 ]; then
+        pid="${d##* }"
+        job_alive "$pid" && kill "$pid" 2>/dev/null
+        logit "recover: superseding in-flight driver ($d) by --force"
+      else
+        echo "cc-self recover: a ${d%% *} driver is already in flight for sid=$SID (${d#* }) — not re-arming. End the turn and let it finish; --force supersedes it." >&2
+        exit 2
+      fi
+    fi
+    OFF_ARM="$(wc -c < "$TRANSCRIPT" 2>/dev/null | tr -d ' ')"; [ -n "$OFF_ARM" ] || OFF_ARM=0
     rc_state ARMED
     # Wrap the instructions into /compact "...". Double quotes inside the
     # instructions would fight the wrapping quotes — normalize to single.
@@ -330,172 +627,185 @@ WKR
       exit 1
     fi
     rm -f "$TMPC"
-    tmux send-keys -t "$PANE" Enter      # mid-turn: /compact queues, drains at idle
+    # mid-turn: /compact queues and drains at idle; at idle it runs at once.
+    # Either way the staged text leaves the box on a registered Enter. The
+    # "compaction failed" baseline is counted BEFORE the Enter: at idle the
+    # failure line ("Not enough messages to compact.") is synchronous and
+    # would already be on screen by the time the driver starts.
+    COMPACT_FAIL_RE='Compaction failed|Error compacting|Not enough messages to compact|No messages to compact|Compaction canceled'
+    FAILS0="$(norm | tail -40 | grep -cE "$COMPACT_FAIL_RE")"
+    if ! submit "$PASTE_BOX"; then
+      rc_state FAILED-COMPACT_SUBMIT "Enter did not submit; /compact text left staged in the box"
+      logit "recover FAIL: /compact Enter did not submit (box: $(box))"
+      echo "cc-self recover: Enter did not submit the staged /compact — peek; the text is still in the box" >&2
+      exit 1
+    fi
+    sleep 1
+    if [ "$(norm | tail -40 | grep -cE "$COMPACT_FAIL_RE")" -gt "$FAILS0" ]; then
+      why="$(norm | tail -40 | grep -E "$COMPACT_FAIL_RE" | tail -1 | sed 's/^[[:space:]⎿]*//')"
+      rc_state FAILED-COMPACT_DONE "compaction did not happen: $why"
+      logit "recover FAIL: $why"
+      echo "cc-self recover: the TUI refused the compaction ($why) — nothing armed; the guard will instruct the next step" >&2
+      exit 1
+    fi
     rc_state COMPACT_SUBMITTED
-    TMUX_BIN="$(command -v tmux)"
     RDRIVER="$HOME/.cc-self-recover-driver.sh"
-    cat > "$RDRIVER" <<'RCV'
+    cat > "$RDRIVER.tmp" <<'RCV'
 #!/bin/bash
 # cc-self recover driver — runs detached under the tmux server.
-# Phases: ARMED → COMPACT_SUBMITTED → COMPACT_DONE → MODEL_DIALOG → SWITCHED
-#         → VERIFY_WAKE → DONE, or FAILED-<phase> (no blind keypress, ever).
-# Verification truth source: the session transcript (message.model), NOT the
-# statusline — statuslines are user-configurable; toast/label checks are
-# advisory logging only.
-PANE="$1"; SID="$2"; BASELINE="$3"; LABEL="$4"; ATTEMPT="$5"; TMUX_BIN="$6"; STATE="$7"; TRANSCRIPT="$8"
-STATE_DIR="$(dirname "$STATE")"; YIELD="$STATE_DIR/yield-$SID"
-log()  { printf '%s [recover-driver] %s\n' "$(date '+%F %T')" "$*"; }
-norm() { "$TMUX_BIN" capture-pane -p -t "$PANE" 2>/dev/null | tr '\302\240' ' '; }
-fg()   { "$TMUX_BIN" display-message -p -t "$PANE" '#{pane_current_command}' 2>/dev/null; }
+# Phases: ARMED → COMPACT_SUBMITTED → COMPACT_DONE → SWITCH_SUBMITTED → SWITCHED
+#         → VERIFY_WAKE → DONE, or FAILED-<phase>. No blind keypress, ever, and
+#         the process ALWAYS exits 0 (a non-zero exit of a tmux run-shell -b
+#         job is echoed by tmux as a view-mode overlay on the FOCUSED pane).
+# Truth sources: the session transcript (compact_boundary → compaction done;
+# message.model → live model). Screen text is used to drive the TUI and as a
+# fallback signal; statusline/toast checks are advisory only.
+PANE="$1"; SID="$2"; BASELINE="$3"; LABEL="$4"; ATTEMPT="$5"; TMUX_BIN="$6"; STATE="$7"; TRANSCRIPT="$8"; OFF_ARM="$9"; PY_BIN="${10:-}"; LIB="${11}"; FAILS0="${12:-0}"
+[ -n "$PANE" ] && [ -n "$TMUX_BIN" ] && [ -f "$LIB" ] && [ -n "$STATE" ] || { echo "cc-self recover driver: missing PANE/TMUX_BIN/LIB/STATE — refusing to run" >&2; exit 0; }
+export PANE TMUX_BIN PY_BIN LOGTAG=recover-driver
+# shellcheck disable=SC1090  # generated by scripts/cc-self
+. "$LIB" || exit 0
+STATE_DIR="$(dirname "$STATE")"; YIELD="$STATE_DIR/yield-$SID"; SCREEN="$STATE_DIR/recover-$SID-screen.txt"
 set_state() {  # set_state <phase> [note] — note may quote screen content; keep the JSON valid
-  local n; n="$(printf '%s' "${2:-}" | tr '\042\134' '\047 ')"
-  printf '{"sid":"%s","pane":"%s","baseline":"%s","label":"%s","attempt":%s,"phase":"%s","note":"%s","ts":"%s"}\n' \
-    "$SID" "$PANE" "$BASELINE" "$LABEL" "$ATTEMPT" "$1" "$n" "$(date '+%FT%T%z')" > "$STATE.tmp" && mv "$STATE.tmp" "$STATE"
+  if grep -q '"phase":"CLOSED"' "$STATE" 2>/dev/null; then log "closed by operator — stopping"; rm -f "$YIELD"; exit 0; fi
+  local n; n="$(printf '%s' "${2:-}" | tr '\042\134\n' '\047  ')"
+  printf '{"sid":"%s","pane":"%s","baseline":"%s","label":"%s","attempt":%s,"phase":"%s","note":"%s","pid":%s,"ts":"%s"}\n' \
+    "$SID" "$PANE" "$BASELINE" "$LABEL" "$ATTEMPT" "$1" "$n" "$$" "$(date '+%FT%T%z')" > "$STATE.$$.tmp" && mv "$STATE.$$.tmp" "$STATE"
 }
-fail() { log "FAIL $1${2:+: $2}"; set_state "FAILED-$1" "${2:-}"; rm -f "$YIELD"; exit 1; }
-alive() {  # pane must exist and still run the TUI (a plain shell = session gone)
+finish() { rm -f "$YIELD"; exit 0; }
+fail() {  # fail <phase> [why] — record, dump the screen for diagnosis, exit 0
+  norm | tail -40 > "$SCREEN" 2>/dev/null
+  log "FAIL $1${2:+: $2} (screen: $SCREEN)"
+  set_state "FAILED-$1" "${2:-}; screen dump: $SCREEN"
+  finish
+}
+alive() {  # pane must exist and still run the TUI (no claude process in its tree = session gone)
   norm >/dev/null || fail "$1" "pane gone (capture failed)"
-  case "$(fg)" in ''|zsh|bash|fish|sh) fail "$1" "TUI not foreground (fg=$(fg))" ;; esac
+  tui_alive || fail "$1" "no Claude Code process in pane $PANE (fg=$(fg))"
 }
-mode_fix() { norm | tail -6 | grep -qE -- '-- NORMAL --' && { "$TMUX_BIN" send-keys -t "$PANE" -l 'i'; sleep 0.3; }; }
-box() { norm | grep '^❯' | tail -1 | sed 's/^❯ *//; s/ *$//'; }
-live_model() {  # newest assistant model appended to the transcript after byte offset $1
-  python3 - "$TRANSCRIPT" "$1" <<'PY' 2>/dev/null
-import json, sys
-try:
-    f = open(sys.argv[1], 'rb'); f.seek(int(sys.argv[2])); data = f.read().decode('utf-8', 'ignore')
-except Exception:
-    sys.exit(0)
-out = ""
-for line in data.splitlines():
-    try:
-        d = json.loads(line)
-    except Exception:
-        continue
-    m = d.get("message", {})
-    if isinstance(m, dict) and m.get("role") == "assistant":
-        mod = m.get("model")
-        if mod and mod != "<synthetic>":
-            out = mod
-print(out)
-PY
-}
+screen_has() { norm | tail -"${2:-20}" | grep -qE "$1"; }
+# text that may already be on screen from an EARLIER event (a previous
+# "Not enough messages to compact.", an older "Set model to") must not be
+# mistaken for a new one: count matches before, react only to an increase
+screen_count() { norm | tail -"${2:-25}" | grep -cE "$1"; }
+COMPACT_FAIL_RE='Compaction failed|Error compacting|Not enough messages to compact|No messages to compact|Compaction canceled'
+SWITCH_OK_RE='Set model to|Kept model as'
+SWITCH_ERR_RE='Model switch failed|Unknown model|Invalid model|not a valid model|is not available'
 
+set_state COMPACT_SUBMITTED "driver started"
 log "armed pane=$PANE sid=$SID baseline=$BASELINE label=${LABEL:-(none)} attempt=$ATTEMPT"
 # yield-valve: a session whose Stop hook always blocks never goes idle, so the
 # queued /compact would never drain. Contract: the driver raises this flag; a
 # cooperating Stop hook sees it, deletes it, and lets ONE stop through.
 touch "$YIELD"
 
-# ---- wait for the running turn to end AND the compaction to finish --------
-# The running turn and the compaction spinner both render a "... to interrupt"
-# hint near the bottom; compaction additionally shows "Compacting". Quiet =
-# neither marker in the bottom window for 3 consecutive polls. The queued
-# /compact drains within a tick of turn end, so the gap between the two busy
-# phases cannot produce 3 quiet polls (6s). The window is tail -15 on purpose:
-# conversation text higher up may legitimately CONTAIN these words.
-sleep 5
-quiet=0
-for _ in $(seq 1 300); do   # up to 10 min — compaction of a large context is slow
-  if norm | tail -15 | grep -qE 'to interrupt|Compacting'; then quiet=0; else quiet=$((quiet+1)); fi
-  [ "$quiet" -ge 3 ] && break
+# ---- wait for the compaction (transcript truth) -----------------------------
+# The queued /compact drains when the running turn ends — which may be a long
+# time if the session keeps working. Wait as long as the TUI is alive (up to
+# 90 min), heartbeating the state so the guard keeps trusting the in-flight
+# phase. Compaction done = a compact_boundary record appended after the arm
+# offset; fallback = "Compacting" was seen on screen and the TUI went idle.
+compact_seen=0; ok=0; t0=$(date +%s); hb=$t0; fails0="$FAILS0"   # baseline counted by the CLI before the Enter
+while [ $(( $(date +%s) - t0 )) -lt 5400 ]; do
+  alive COMPACT_DONE
+  [ "$(tx_after "$TRANSCRIPT" "$OFF_ARM" compact)" = "1" ] && { ok=1; break; }
+  if screen_has 'Compacting' 15; then compact_seen=1
+  elif [ "$compact_seen" -eq 1 ] && wait_idle 10; then ok=2; break; fi
+  [ "$(screen_count "$COMPACT_FAIL_RE" 40)" -gt "$fails0" ] \
+    && fail COMPACT_DONE "compaction did not happen: $(norm | tail -40 | grep -E "$COMPACT_FAIL_RE" | tail -1)"
+  if [ $(( $(date +%s) - hb )) -ge 60 ]; then set_state COMPACT_SUBMITTED "waiting for turn end + compaction ($(( ($(date +%s) - t0) / 60 ))m)"; hb=$(date +%s); fi
   sleep 2
 done
-[ "$quiet" -ge 3 ] || fail COMPACT_DONE "turn/compaction still busy after 10 min"
-alive COMPACT_DONE
-set_state COMPACT_DONE
-log "compaction finished → staging /model"
+[ "$ok" -ne 0 ] || fail COMPACT_DONE "no compaction after 90 min (turn never ended, or /compact was dropped)"
+set_state COMPACT_DONE "$([ "$ok" -eq 1 ] && echo 'transcript compact_boundary' || echo 'screen: Compacting seen, then idle')"
+log "compaction finished ($([ "$ok" -eq 1 ] && echo transcript || echo screen)) → waiting for the TUI to settle"
+# post-compaction the TUI re-renders and runs SessionStart(compact) hooks
+wait_idle 600; rc=$?
+[ "$rc" -eq 2 ] && fail COMPACT_DONE "pane/TUI gone while settling"
+[ "$rc" -eq 1 ] && fail COMPACT_DONE "TUI still busy 10 min after compaction ($(norm | tail -15 | grep -vE '^\s*$' | tail -3 | tr '\n' '|'))"
 
-# ---- stage + submit /model <baseline> (opens a confirm dialog) ------------
+# ---- stage + submit /model <baseline> ---------------------------------------
 # Staged via bracketed paste (single event — the command palette opened by the
 # leading "/" cannot swallow same-tick characters), verified, then submitted.
 CMD="/model $BASELINE"
-staged=0
-for i in 1 2 3; do
-  mode_fix
-  f="$(mktemp "${TMPDIR:-/tmp}/cc-self-rcv.XXXXXX")"
-  printf '%s' "$CMD" > "$f"
-  "$TMUX_BIN" load-buffer -b cc-self-rcv "$f"
-  rm -f "$f"
-  "$TMUX_BIN" paste-buffer -p -b cc-self-rcv -t "$PANE"
-  "$TMUX_BIN" delete-buffer -b cc-self-rcv 2>/dev/null
-  sleep 1
-  [ "$(box)" = "$CMD" ] && { staged=1; break; }
-  log "stage attempt $i: box holds '$(box)' — clearing and retrying"
-  "$TMUX_BIN" send-keys -N 80 -t "$PANE" BSpace   # idle here: BSpace is safe, Escape is not
-  sleep 0.5
-done
-[ "$staged" -eq 1 ] || fail MODEL_DIALOG "could not stage $CMD in the input box"
+stage_exact "$CMD" || fail SWITCH_SUBMITTED "could not stage '$CMD' in the input box (box: '$(box)')"
+ok0="$(screen_count "$SWITCH_OK_RE" 25)"; err0="$(screen_count "$SWITCH_ERR_RE" 25)"
 "$TMUX_BIN" send-keys -t "$PANE" Enter
-set_state MODEL_DIALOG
-
-# never press blind: approve only after SEEING the dialog with the expected
-# option highlighted
-seen=0
-for _ in $(seq 1 15); do
+set_state SWITCH_SUBMITTED
+# Outcomes, observed rather than assumed:
+#  (a) "Switch model?" confirm dialog — appears only when a warm prompt cache
+#      would be invalidated; compaction acks that, so post-compaction switches
+#      are normally dialog-free. Approve only after SEEING "Yes, switch to"
+#      highlighted; move the cursor if "No, go back" is.
+#  (b) "Set model to …" / "Kept model as …" — switched directly.
+#  (c) the box still holds the command — the Enter was swallowed; retry once.
+#  (d) an error line — hard failure with the screen dumped.
+outcome=""; enters=1; t0=$(date +%s)
+while [ $(( $(date +%s) - t0 )) -lt 30 ]; do
   s="$(norm)"
   if printf '%s\n' "$s" | grep -q 'Switch model?'; then
-    seen=1
-    printf '%s\n' "$s" | grep -qE '❯ *1\. Yes, switch to' && { seen=2; break; }
+    if printf '%s\n' "$s" | grep -qE '❯ *([0-9]+\. )?Yes, switch to'; then
+      "$TMUX_BIN" send-keys -t "$PANE" Enter; outcome=dialog; break
+    elif printf '%s\n' "$s" | grep -qE '❯ *([0-9]+\. )?No, go back'; then
+      "$TMUX_BIN" send-keys -t "$PANE" Up; sleep 0.5; continue
+    fi
+  elif [ "$(printf '%s\n' "$s" | tail -25 | grep -cE "$SWITCH_OK_RE")" -gt "$ok0" ]; then
+    outcome=direct; break
+  elif [ "$(printf '%s\n' "$s" | tail -25 | grep -cE "$SWITCH_ERR_RE")" -gt "$err0" ]; then
+    fail SWITCH_SUBMITTED "TUI rejected the switch: $(printf '%s\n' "$s" | tail -25 | grep -E "$SWITCH_ERR_RE" | tail -1)"
+  elif box_holds "$CMD" && [ $(( $(date +%s) - t0 )) -ge 4 ] && [ "$enters" -lt 2 ]; then
+    log "Enter did not submit $CMD — retrying once"; "$TMUX_BIN" send-keys -t "$PANE" Enter; enters=$((enters+1))
   fi
   sleep 1
 done
-if [ "$seen" -ne 2 ]; then
-  if [ "$seen" -eq 1 ]; then
-    "$TMUX_BIN" send-keys -t "$PANE" Escape   # a dialog IS confirmed open — Escape only cancels it
-    fail MODEL_DIALOG "dialog open but 'Yes, switch to' not highlighted"
+if [ "$outcome" = "dialog" ]; then
+  # the Enter must CLOSE the dialog: typing into a still-open dialog is
+  # dangerous (digits select options), so a dialog that never closes is a
+  # hard failure, not something to type past
+  closed=0
+  for _ in $(seq 1 15); do screen_has 'Switch model\?' 30 || { closed=1; break; }; sleep 1; done
+  [ "$closed" -eq 1 ] || fail SWITCHED "dialog did not close after Enter"
+elif [ -z "$outcome" ]; then
+  if dialog_open; then
+    "$TMUX_BIN" send-keys -t "$PANE" Escape   # a dialog IS open — Escape only cancels it
+    fail SWITCH_SUBMITTED "an unrecognized dialog is open after /model"
   fi
-  fail MODEL_DIALOG "Switch model dialog never appeared"
+  box_holds "$CMD" && fail SWITCH_SUBMITTED "the box still holds '$(box)' — /model was not accepted"
+  # no dialog, no message, box empty: the switch may simply have rendered
+  # nothing recognizable. Not a failure — the transcript verdict below is the
+  # truth, and the guard escalates if it did not take.
+  outcome=unconfirmed
 fi
-"$TMUX_BIN" send-keys -t "$PANE" Enter
-
-# ---- confirm the Enter registered: the dialog must CLOSE ------------------
-# TUI signal, independent of any user statusline config. Typing into a still-
-# open dialog is dangerous (digits select options), so a dialog that never
-# closes is a hard failure, not something to type past.
-closed=0
-for _ in $(seq 1 15); do
-  norm | tail -12 | grep -qE '❯ *1\. Yes, switch to' || { closed=1; break; }
-  sleep 1
-done
-[ "$closed" -eq 1 ] || fail SWITCHED "dialog did not close after Enter"
-# Advisory only (user statuslines vary; the toast wording may change across
-# TUI versions): note whether a toast/label happened to confirm, never fail.
-adv="unconfirmed"
-for _ in $(seq 1 5); do
-  s="$(norm | tail -8)"
-  { [ -n "$LABEL" ] && printf '%s\n' "$s" | grep -qF "[$LABEL]"; } || printf '%s\n' "$s" | grep -q 'Set model to' \
-    && { adv="confirmed"; break; }
-  sleep 1
-done
-set_state SWITCHED "dialog approved+closed; toast/statusline advisory: $adv"
-log "dialog approved and closed (advisory: $adv)"
+# Advisory only (user statuslines vary): note whether the label happens to show
+adv="unconfirmed"; sleep 1
+[ -n "$LABEL" ] && screen_has "\\[$LABEL\\]" 8 && adv="statusline shows [$LABEL]"
+set_state SWITCHED "switch $outcome; $adv"
+log "switch submitted ($outcome; $adv)"
 
 # ---- wake the session, then verify against the TRANSCRIPT (truth source) ---
 # The switch's real effect is the model of the NEXT turn. The transcript
 # records message.model on every assistant message — the same truth source the
 # guard hook reads, independent of any UI configuration.
 alive VERIFY_WAKE
-OFF0="$(wc -c < "$TRANSCRIPT" 2>/dev/null | tr -d ' ')"
-[ -n "$OFF0" ] || OFF0=0
+wait_idle 120; rc=$?
+[ "$rc" -eq 2 ] && fail VERIFY_WAKE "pane/TUI gone before the wake"
+[ "$rc" -eq 1 ] && fail VERIFY_WAKE "TUI still busy 2 min after the switch — wake not sent ($(convo | sed '/^[[:space:]]*$/d' | tail -2 | tr '\n' '|'))"
+OFF0="$(wc -c < "$TRANSCRIPT" 2>/dev/null | tr -d ' ')"; [ -n "$OFF0" ] || OFF0=0
 set_state VERIFY_WAKE
-sleep 2
-mode_fix
-"$TMUX_BIN" send-keys -t "$PANE" -l -- "[cc-self recover] attempt $ATTEMPT: model switched, verify guard silence and report"
-sleep 0.5
-"$TMUX_BIN" send-keys -t "$PANE" Enter
+WAKE="[cc-self recover] attempt $ATTEMPT: model switched, verify guard silence and report"
+stage_exact "$WAKE" || fail VERIFY_WAKE "could not stage the wake message (box: '$(box)')"
+submit "$WAKE" || fail VERIFY_WAKE "wake message did not submit (box: '$(box)')"
 BASE="${BASELINE%%\[*}"
 verdict=""
-for _ in $(seq 1 90); do   # up to 3 min for the wake turn's first assistant message
-  m="$(live_model "$OFF0")"
+for _ in $(seq 1 150); do   # up to 5 min for the wake turn's first assistant message
+  m="$(tx_after "$TRANSCRIPT" "$OFF0" model)"
   [ -n "$m" ] && { verdict="$m"; break; }
   sleep 2
 done
-rm -f "$YIELD"
 if [ -z "$verdict" ]; then
-  # Inconclusive (no new assistant message seen — transcript path off, python3
-  # missing, or a very slow first turn). NOT a failure: the guard hook reads
-  # the same truth on the wake turn and re-arms with attempt+1 if it re-fell.
+  # Inconclusive (no new assistant message seen — python3 missing, or a very
+  # slow first turn). NOT a failure: the guard hook reads the same truth on
+  # the wake turn and re-arms with attempt+1 if it re-fell.
   set_state DONE "wake sent; transcript verification inconclusive — cross-check a post-wake record before re-arming"
   log "done — wake sent, transcript verification inconclusive"
 elif [ "$verdict" = "$BASE" ]; then
@@ -508,22 +818,35 @@ else
   set_state DONE "re-fell: live model $verdict != baseline $BASE — guard escalates"
   log "done — but live model is $verdict, not $BASE (guard will escalate)"
 fi
+finish
 RCV
-    chmod +x "$RDRIVER"
-    tmux run-shell -b "/bin/bash '$RDRIVER' '$PANE' '$SID' '$BASELINE' '$LABEL' '$ATTEMPT' '$TMUX_BIN' '$STATE' '$TRANSCRIPT' >> '$LOG' 2>&1"
+    chmod +x "$RDRIVER.tmp" && mv "$RDRIVER.tmp" "$RDRIVER"   # never rewrite a helper in place: a running instance reads it incrementally
+    detach "/bin/bash $(shq "$RDRIVER") $(shq "$PANE") $(shq "$SID") $(shq "$BASELINE") $(shq "$LABEL") $(shq "$ATTEMPT") $(shq "$TMUX_BIN") $(shq "$STATE") $(shq "$TRANSCRIPT") $(shq "$OFF_ARM") $(shq "$PY_BIN") $(shq "$LIB") $(shq "$FAILS0")"
     logit "recover: armed sid=$SID baseline=$BASELINE label=${LABEL:-?} attempt=$ATTEMPT compact=${PASTE_BYTES}B"
-    echo "recover armed (attempt $ATTEMPT): /compact queued (${PASTE_BYTES}B) — end the turn now; driver: compaction → /model $BASELINE → dialog → wake → transcript-verify (state: $STATE, log: $LOG)"
+    echo "recover armed (attempt $ATTEMPT): /compact submitted (${PASTE_BYTES}B) — end the turn now and do NOTHING else for this recovery (no /model, no /compact, no wake: the driver does all of it). Driver: compaction → /model $BASELINE → dialog if any → wake → transcript-verify. State: $STATE (cc-self recover --status), log: $LOG"
     ;;
   restart)
     # The session's own death kills its Bash tool too, so the restart
     # sequence is delegated to a process owned by the tmux server
     # (run-shell -b), which outlives the session.
-    SID=""
-    if [ $# -ge 1 ] && [ "$1" != "--" ]; then SID="$1"; shift; fi
+    SID=""; FORCE=0
+    while :; do
+      case "${1:-}" in
+        --force) FORCE=1; shift ;;
+        --) break ;;
+        -*) echo "cc-self restart: unknown option $1"; exit 1 ;;
+        '') break ;;
+        *) [ -z "$SID" ] || { echo "cc-self restart: unexpected argument $1"; exit 1; }; SID="$1"; shift ;;
+      esac
+    done
     [ -n "$SID" ] || SID="$(resolve_sid)"
     [ -n "$SID" ] || { echo "cc-self restart: cannot resolve session id (pass it explicitly)"; exit 1; }
     EXTRA=""
     if [ "${1:-}" = "--" ]; then shift; EXTRA="$*"; fi
+    if d="$(inflight_driver "$SID")"; then
+      if [ "$FORCE" -eq 1 ]; then pid="${d##* }"; job_alive "$pid" && kill "$pid" 2>/dev/null; logit "restart: superseding in-flight driver ($d) by --force"
+      else echo "cc-self restart: a ${d%% *} driver is already in flight for sid=$SID (${d#* }) — not arming; --force supersedes it." >&2; exit 2; fi
+    fi
     CLAUDE_BIN="${CC_SELF_CLAUDE_BIN:-}"
     if [ -z "$CLAUDE_BIN" ]; then
       CLAUDE_BIN="$(command -v claude 2>/dev/null || true)"
@@ -536,12 +859,7 @@ RCV
     # Freshest source is the transcript's last main-chain assistant entry
     # (real JSON keys are unescaped there; quotes inside message text are
     # \"-escaped, so these greps can't match prose). Fallback: settings.json.
-    TRANSCRIPT="$HOME/.claude/projects/$(pwd | sed 's|/|-|g')/$SID.jsonl"
-    if [ ! -f "$TRANSCRIPT" ]; then
-      # the session's cwd may have moved since launch — find the sid anywhere
-      # shellcheck disable=SC2012  # sid is a UUID; glob yields at most one clean path
-      TRANSCRIPT="$(ls "$HOME"/.claude/projects/*/"$SID".jsonl 2>/dev/null | head -1)"
-    fi
+    TRANSCRIPT="$(find_transcript "$SID")"
     MODEL=""; EFFORT=""
     if [ -n "$TRANSCRIPT" ] && [ -f "$TRANSCRIPT" ]; then
       ALINE="$(grep '"type":"assistant"' "$TRANSCRIPT" | grep -v '"isSidechain":true' | grep '"effort":"' | tail -1)"
@@ -556,56 +874,32 @@ RCV
     if [ -n "$MODEL" ] && [ "${SMODEL%%\[*}" = "$MODEL" ]; then MODEL="$SMODEL"; fi
     [ -n "$MODEL" ]  || MODEL="$SMODEL"
     [ -n "$EFFORT" ] || EFFORT="$(grep -o '"effortLevel"[[:space:]]*:[[:space:]]*"[^"]*"' "$SETTINGS" 2>/dev/null | head -1 | cut -d'"' -f4)"
-    TMUX_BIN="$(command -v tmux)"
+    RSTATE="$STATE_DIR/restart-$SID.json"
+    printf '{"sid":"%s","pane":"%s","phase":"ARMED","note":"","pid":0,"ts":"%s"}\n' "$SID" "$PANE" "$(date '+%FT%T%z')" > "$RSTATE"
     DRIVER="$HOME/.cc-self-restart-driver.sh"
-    cat > "$DRIVER" <<'DRV'
+    cat > "$DRIVER.tmp" <<'DRV'
 #!/bin/bash
-# cc-self restart driver — runs detached under the tmux server
-PANE="$1"; SID="$2"; BIN="$3"; TMUX_BIN="$4"; MODEL="$5"; EFFORT="$6"; EXTRA="$7"
-log() { printf '%s [restart-driver] %s\n' "$(date '+%F %T')" "$*"; }
-fg()  { "$TMUX_BIN" display-message -p -t "$PANE" '#{pane_current_command}'; }
-mode_fix() {  # vim NORMAL mode → INSERT
-  "$TMUX_BIN" capture-pane -p -t "$PANE" | tail -6 | grep -qE -- '-- NORMAL --' \
-    && { "$TMUX_BIN" send-keys -t "$PANE" -l 'i'; sleep 0.3; }
+# cc-self restart driver — runs detached under the tmux server. Always exits 0
+# (a non-zero exit of a run-shell -b job is echoed by tmux as a view-mode
+# overlay on the focused pane); outcomes live in the log and the state file.
+PANE="$1"; SID="$2"; BIN="$3"; TMUX_BIN="$4"; MODEL="$5"; EFFORT="$6"; EXTRA="$7"; RSTATE="$8"; LIB="$9"
+[ -n "$PANE" ] && [ -n "$TMUX_BIN" ] && [ -f "$LIB" ] && [ -n "$RSTATE" ] || { echo "cc-self restart driver: missing PANE/TMUX_BIN/LIB/RSTATE — refusing to run" >&2; exit 0; }
+export PANE TMUX_BIN LOGTAG=restart-driver
+# shellcheck disable=SC1090  # generated by scripts/cc-self
+. "$LIB" || exit 0
+set_state() {
+  local n; n="$(printf '%s' "${2:-}" | tr '\042\134\n' '\047  ')"
+  printf '{"sid":"%s","pane":"%s","phase":"%s","note":"%s","pid":%s,"ts":"%s"}\n' "$SID" "$PANE" "$1" "$n" "$$" "$(date '+%FT%T%z')" > "$RSTATE.$$.tmp" && mv "$RSTATE.$$.tmp" "$RSTATE"
 }
-tui_type() { mode_fix; "$TMUX_BIN" send-keys -t "$PANE" -l -- "$1"; sleep 0.5; "$TMUX_BIN" send-keys -t "$PANE" Enter; }
-# At idle the leading "/" opens the command palette, and characters that
-# arrive in the same input tick can be swallowed by its initialization
-# (observed live: only the trailing "t" of /exit survived and Enter
-# submitted it as a user message). Stage the command in two paced sends
-# and press Enter only after the input box visibly holds /exit.
-type_exit() {
-  for attempt in 1 2 3; do
-    mode_fix
-    "$TMUX_BIN" send-keys -t "$PANE" -l '/'
-    sleep 0.6
-    "$TMUX_BIN" send-keys -t "$PANE" -l 'exit'
-    sleep 0.6
-    # capture-pane pads to full pane height with blank lines, so strip them
-    # before windowing; the TUI also renders a no-break space (C2 A0) after
-    # the ❯ prompt — normalize it to plain spaces before matching
-    if "$TMUX_BIN" capture-pane -p -t "$PANE" | sed '/^[[:space:]]*$/d' | tail -10 | tr '\302\240' '  ' | grep -qE '[>❯] */exit'; then
-      "$TMUX_BIN" send-keys -t "$PANE" Enter
-      return 0
-    fi
-    log "stage attempt $attempt: /exit not in input box → clear and retry"
-    "$TMUX_BIN" send-keys -t "$PANE" Escape
-    sleep 0.3
-    for _ in $(seq 1 8); do "$TMUX_BIN" send-keys -t "$PANE" BSpace; done
-    sleep 0.5
-  done
-  log "FAIL: could not stage /exit after 3 attempts — aborting, session left intact"
-  return 1
-}
+fail() { log "FAIL $1${2:+: $2}"; set_state "FAILED-$1" "${2:-}"; exit 0; }
+tui_gone() { ! tui_alive; }   # claude exited = no claude process left in the pane's tree
 
+set_state WAIT_TURN "driver started"
 log "start pane=$PANE sid=$SID"
-sleep 15                              # let the session finish its last message
-idle=0
-for _ in $(seq 1 60); do              # wait for turn streaming to end (max 2 min)
-  if "$TMUX_BIN" capture-pane -p -t "$PANE" | grep -q 'to interrupt'; then idle=0; else idle=$((idle+1)); fi
-  [ "$idle" -ge 3 ] && break
-  sleep 2
-done
+sleep 10                              # let the session finish its last message
+wait_idle 1800; rc=$?                 # wait for the turn to end (max 30 min)
+[ "$rc" -eq 2 ] && fail WAIT_TURN "pane/TUI gone"
+[ "$rc" -eq 1 ] && fail WAIT_TURN "turn still busy after 30 min — session left intact"
 # preserve session state across the relaunch: pin the model + effort captured
 # at arm time (a bare --resume falls back to defaults — effort resets and the
 # changed system prompt breaks the warm prompt cache), keep the bypass flag
@@ -616,44 +910,60 @@ done
 # found" — the relaunch never runs).
 case " $EXTRA" in *" --model"*)  MODEL=""  ;; esac
 case " $EXTRA" in *" --effort"*) EFFORT="" ;; esac
+shq() { printf "'%s'" "$(printf '%s' "$1" | sed "s/'/'\\\\''/g")"; }
 FLAGS=""
-[ -n "$MODEL" ]  && FLAGS="$FLAGS --model '$MODEL'"
-[ -n "$EFFORT" ] && FLAGS="$FLAGS --effort '$EFFORT'"
-"$TMUX_BIN" capture-pane -p -t "$PANE" | grep -q 'bypass permissions on' && FLAGS="$FLAGS --dangerously-skip-permissions"
+[ -n "$MODEL" ]  && FLAGS="$FLAGS --model $(shq "$MODEL")"
+[ -n "$EFFORT" ] && FLAGS="$FLAGS --effort $(shq "$EFFORT")"
+norm | grep -q 'bypass permissions on' && FLAGS="$FLAGS --dangerously-skip-permissions"
 if [ -n "$EXTRA" ]; then
   read -ra EXTRA_WORDS <<< "$EXTRA"
-  for w in "${EXTRA_WORDS[@]}"; do FLAGS="$FLAGS '$w'"; done
+  for w in "${EXTRA_WORDS[@]}"; do FLAGS="$FLAGS $(shq "$w")"; done
 fi
 log "turn idle → sending /exit (resume flags:${FLAGS:- none})"
-type_exit || exit 1
+set_state EXIT
+# /exit is staged (bracketed paste, verified in the box), never typed blind:
+# at idle the leading "/" opens the command palette, which can swallow
+# same-tick characters (a live incident submitted the stray remainder as a
+# fake user message).
+stage_exact '/exit' || fail EXIT "could not stage /exit — session left intact (box: '$(box)')"
+submit '/exit' || fail EXIT "Enter did not submit /exit — session left intact"
 # /exit with live background tasks opens a "Background work is running"
 # confirm dialog instead of exiting — Enter takes the preselected
 # "Exit and stop tasks" (restart kills background work by contract).
 for _ in $(seq 1 90); do
-  case "$(fg)" in zsh|bash|fish|sh) break ;; esac
-  if "$TMUX_BIN" capture-pane -p -t "$PANE" | grep -q 'Background work is running'; then
+  tui_gone && break
+  if norm | grep -q 'Background work is running'; then
     log "background-work dialog → confirming (exit and stop tasks)"
     "$TMUX_BIN" send-keys -t "$PANE" Enter
   fi
   sleep 1
 done
-case "$(fg)" in zsh|bash|fish|sh) ;; *) log "FAIL: claude did not exit (fg=$(fg))"; exit 1 ;; esac
+tui_gone || fail EXIT "claude did not exit (fg=$(fg))"
 log "claude exited → relaunching (real binary, alias bypassed)"
+set_state RELAUNCH
 sleep 1
-"$TMUX_BIN" send-keys -t "$PANE" -l -- "$BIN --resume $SID$FLAGS"
+"$TMUX_BIN" send-keys -t "$PANE" -l -- "$(shq "$BIN") --resume $SID$FLAGS"
 sleep 0.5
 "$TMUX_BIN" send-keys -t "$PANE" Enter
-for _ in $(seq 1 60); do case "$(fg)" in zsh|bash|fish|sh) sleep 1 ;; *) break ;; esac; done
-case "$(fg)" in zsh|bash|fish|sh) log "FAIL: claude did not come back"; exit 1 ;; esac
+for _ in $(seq 1 60); do tui_gone || break; sleep 1; done
+tui_gone && fail RELAUNCH "claude did not come back"
 log "claude relaunched → waiting for session load"
-sleep 12
-tui_type '[cc-self restart driver] Automated restart sequence complete. Verify session continuity and report the result to the user.'
-log "wake-up message sent — driver done"
+set_state WAKE
+wait_idle 300; rc=$?
+[ "$rc" -eq 0 ] || fail WAKE "resumed session did not settle (rc=$rc)"
+WAKE='[cc-self restart driver] Automated restart sequence complete. Verify session continuity and report the result to the user.'
+if stage_exact "$WAKE" && submit "$WAKE"; then
+  set_state DONE "resumed and woken"
+  log "wake-up message sent — driver done"
+else
+  fail WAKE "could not stage/submit the wake message (box: '$(box)')"
+fi
+exit 0
 DRV
-    chmod +x "$DRIVER"
-    tmux run-shell -b "/bin/bash '$DRIVER' '$PANE' '$SID' '$CLAUDE_BIN' '$TMUX_BIN' '$MODEL' '$EFFORT' '$EXTRA' >> '$LOG' 2>&1"
+    chmod +x "$DRIVER.tmp" && mv "$DRIVER.tmp" "$DRIVER"   # never rewrite a helper in place
+    detach "/bin/bash $(shq "$DRIVER") $(shq "$PANE") $(shq "$SID") $(shq "$CLAUDE_BIN") $(shq "$TMUX_BIN") $(shq "$MODEL") $(shq "$EFFORT") $(shq "$EXTRA") $(shq "$RSTATE") $(shq "$LIB")"
     logit "restart: sid=$SID bin=$CLAUDE_BIN model=${MODEL:-?} effort=${EFFORT:-?}${EXTRA:+ extra=$EXTRA}"
-    echo "restart driver armed — after this turn ends: /exit → resume pinning model=${MODEL:-default} effort=${EFFORT:-default}${EXTRA:+ + $EXTRA} (log: $LOG)"
+    echo "restart driver armed — after this turn ends: /exit → resume pinning model=${MODEL:-default} effort=${EFFORT:-default}${EXTRA:+ + $EXTRA} (state: $RSTATE, log: $LOG)"
     ;;
   *)
     usage
