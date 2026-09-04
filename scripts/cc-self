@@ -31,6 +31,10 @@
 #                                     command verbatim and win over the pinned
 #                                     ones (e.g. -- --effort max)
 #   cc-self recover --compact-file <f> [--baseline <model>] [--attempt N]
+#   cc-self recover --switch-only     plain /model switch (no compaction) for a
+#                                     session that merely STARTED below the
+#                                     baseline (attempt 0; the guard escalates
+#                                     to compact-first if it falls back again)
 #   cc-self recover --close           close the recovery by operator decision
 #                                     (guard stops instructing re-arms)
 #                                     deterministic model-fallback recovery:
@@ -64,7 +68,7 @@ set -u
 LOG="${CC_SELF_LOG:-$HOME/.cc-self.log}"
 PANE="${CC_SELF_PANE:-${TMUX_PANE:-}}"
 
-usage() { sed -n '5,45p' "$0" | sed 's/^# \{0,1\}//'; exit 1; }
+usage() { sed -n '5,49p' "$0" | sed 's/^# \{0,1\}//'; exit 1; }
 logit() { printf '%s pane=%s %s\n' "$(date '+%F %T')" "$PANE" "$*" >> "$LOG"; }
 
 resolve_sid() {
@@ -243,7 +247,11 @@ WKR
       # short summary instead of the (possibly huge) text itself
       NOTE="$TEXT"
       [ "$PASTE" -eq 1 ] && NOTE="pasted input (${BYTES} bytes)"
-      tmux run-shell -b "/bin/bash '$WAKER' '$PANE' '$NOTE' '$TMUX_BIN' >> '$LOG' 2>&1"
+      # `|| true`: tmux shows a failing run-shell command in a view-mode pane
+      # ("... returned 1") that takes over the user's screen until dismissed;
+      # every failure is already recorded in the log (and, for the recover
+      # driver, in its state file), so the exit status carries nothing new
+      tmux run-shell -b "/bin/bash '$WAKER' '$PANE' '$NOTE' '$TMUX_BIN' >> '$LOG' 2>&1 || true"
     fi
     logit "type$([ $NO_ENTER -eq 1 ] && echo ' (no-enter)')$([ $WAKE -eq 1 ] && echo ' (+wake)'): $DESC"
     echo "sent to $PANE: $DESC$([ $NO_ENTER -eq 1 ] && echo ' (no Enter)')$([ $WAKE -eq 1 ] && echo ' (+wake queued)')"
@@ -267,7 +275,7 @@ WKR
     # back, approving the dialog after seeing it, waking the session, and
     # verifying the live model from the transcript — is done mechanically by a
     # detached driver. See skills/model-recovery/SKILL.md.
-    COMPACT_FILE=""; BASELINE=""; ATTEMPT=1; CLOSE=0
+    COMPACT_FILE=""; BASELINE=""; ATTEMPT=""; CLOSE=0; SWITCH_ONLY=0
     while :; do
       case "${1:-}" in
         --compact-file) [ -n "${2:-}" ] || { echo "cc-self recover: --compact-file needs a path"; exit 1; }
@@ -276,13 +284,21 @@ WKR
                         BASELINE="$2"; shift 2 ;;
         --attempt)      [ -n "${2:-}" ] || { echo "cc-self recover: --attempt needs a number"; exit 1; }
                         ATTEMPT="$2"; shift 2 ;;
+        --switch-only)  SWITCH_ONLY=1; shift ;;
         --close)        CLOSE=1; shift ;;
         *) break ;;
       esac
     done
-    [ "$CLOSE" -eq 1 ] || [ -n "$COMPACT_FILE" ] || { echo "cc-self recover: --compact-file <path> is required (instructions only — no /compact prefix)"; exit 1; }
-    [ "$CLOSE" -eq 1 ] || [ -f "$COMPACT_FILE" ] || { echo "cc-self recover: no such file: $COMPACT_FILE"; exit 1; }
+    if [ "$SWITCH_ONLY" -eq 1 ] && [ -n "$COMPACT_FILE" ]; then
+      echo "cc-self recover: --switch-only takes no --compact-file (a plain switch never compacts)"; exit 1
+    fi
+    [ "$CLOSE" -eq 1 ] || [ "$SWITCH_ONLY" -eq 1 ] || [ -n "$COMPACT_FILE" ] || { echo "cc-self recover: --compact-file <path> is required (instructions only — no /compact prefix), or --switch-only for a plain switch"; exit 1; }
+    [ -z "$COMPACT_FILE" ] || [ -f "$COMPACT_FILE" ] || { echo "cc-self recover: no such file: $COMPACT_FILE"; exit 1; }
+    # attempt numbering: a plain switch is attempt 0, so the compact-first
+    # ladder the guard escalates to afterwards starts at 1
+    if [ -z "$ATTEMPT" ]; then ATTEMPT=1; [ "$SWITCH_ONLY" -eq 1 ] && ATTEMPT=0; fi
     case "$ATTEMPT" in ''|*[!0-9]*) echo "cc-self recover: --attempt must be a number"; exit 1 ;; esac
+    MODE=compact; [ "$SWITCH_ONLY" -eq 1 ] && MODE=switch
     [ -n "$BASELINE" ] || BASELINE="$(settings_model)"
     [ -n "$BASELINE" ] || { echo "cc-self recover: cannot resolve baseline (no --baseline, no model in settings.json)"; exit 1; }
     LABEL="$(model_label "$BASELINE")"
@@ -300,8 +316,8 @@ WKR
     TRANSCRIPT="$HOME/.claude/projects/$(pwd | sed 's|/|-|g')/$SID.jsonl"
     rc_state() {  # rc_state <phase> [note] — note may quote screen content; keep the JSON valid
       local n; n="$(printf '%s' "${2:-}" | tr '\042\134' '\047 ')"
-      printf '{"sid":"%s","pane":"%s","baseline":"%s","label":"%s","attempt":%s,"phase":"%s","note":"%s","ts":"%s"}\n' \
-        "$SID" "$PANE" "$BASELINE" "$LABEL" "$ATTEMPT" "$1" "$n" "$(date '+%FT%T%z')" > "$STATE.tmp" && mv "$STATE.tmp" "$STATE"
+      printf '{"sid":"%s","pane":"%s","baseline":"%s","label":"%s","attempt":%s,"mode":"%s","phase":"%s","note":"%s","ts":"%s"}\n' \
+        "$SID" "$PANE" "$BASELINE" "$LABEL" "$ATTEMPT" "$MODE" "$1" "$n" "$(date '+%FT%T%z')" > "$STATE.tmp" && mv "$STATE.tmp" "$STATE"
     }
     if [ "$CLOSE" -eq 1 ]; then
       # Terminal state by OPERATOR decision — the guard stops instructing
@@ -317,40 +333,53 @@ WKR
       exit 0
     fi
     rc_state ARMED
-    # Wrap the instructions into /compact "...". Double quotes inside the
-    # instructions would fight the wrapping quotes — normalize to single.
-    TMPC="$(mktemp "${TMPDIR:-/tmp}/cc-self-recover.XXXXXX")"
-    INSTR="$(sed "s/\"/'/g" "$COMPACT_FILE")"
-    printf '/compact "%s"' "$INSTR" > "$TMPC"
-    if ! paste_stage "$TMPC"; then
+    PASTE_BYTES=0
+    if [ "$MODE" = compact ]; then
+      # Wrap the instructions into /compact "...". Double quotes inside the
+      # instructions would fight the wrapping quotes — normalize to single.
+      # Newlines are folded to spaces: the paste is verified by reading the
+      # input box's last ❯ row, and a multi-line paste taller than the box's
+      # viewport leaves that row EMPTY — the verify then misread a delivered
+      # paste as "nothing arrived" and re-pasted it 4 times (observed live
+      # 2026-09-02). The instructions are prose; one line loses nothing.
+      TMPC="$(mktemp "${TMPDIR:-/tmp}/cc-self-recover.XXXXXX")"
+      INSTR="$(sed "s/\"/'/g" "$COMPACT_FILE" | tr '\n' ' ' | sed -E 's/[[:space:]]+/ /g; s/^ //; s/ $//')"
+      printf '/compact "%s"' "$INSTR" > "$TMPC"
+      if ! paste_stage "$TMPC"; then
+        rm -f "$TMPC"
+        rc_state FAILED-COMPACT_STAGE "paste did not verify (box: ${PASTE_BOX:-empty})"
+        logit "recover FAIL: compact paste did not verify (box: ${PASTE_BOX:-empty})"
+        echo "cc-self recover: compact paste did not verify — nothing submitted; peek and recover" >&2
+        exit 1
+      fi
       rm -f "$TMPC"
-      rc_state FAILED-COMPACT_STAGE "paste did not verify (box: ${PASTE_BOX:-empty})"
-      logit "recover FAIL: compact paste did not verify (box: ${PASTE_BOX:-empty})"
-      echo "cc-self recover: compact paste did not verify — nothing submitted; peek and recover" >&2
-      exit 1
+      tmux send-keys -t "$PANE" Enter      # mid-turn: /compact queues, drains at idle
+      rc_state COMPACT_SUBMITTED
     fi
-    rm -f "$TMPC"
-    tmux send-keys -t "$PANE" Enter      # mid-turn: /compact queues, drains at idle
-    rc_state COMPACT_SUBMITTED
     TMUX_BIN="$(command -v tmux)"
     RDRIVER="$HOME/.cc-self-recover-driver.sh"
     cat > "$RDRIVER" <<'RCV'
 #!/bin/bash
 # cc-self recover driver — runs detached under the tmux server.
-# Phases: ARMED → COMPACT_SUBMITTED → COMPACT_DONE → MODEL_DIALOG → SWITCHED
-#         → VERIFY_WAKE → DONE, or FAILED-<phase> (no blind keypress, ever).
+# Phases (mode compact): ARMED → COMPACT_SUBMITTED → COMPACT_DONE → MODEL_DIALOG
+#         → SWITCHED → VERIFY_WAKE → DONE, or FAILED-<phase> (no blind keypress).
+# Phases (mode switch):  ARMED → TURN_IDLE → MODEL_DIALOG → SWITCHED → ... — no
+#         compaction; for a session that merely STARTED below the baseline.
+# MODEL_DIALOG is skipped when the transcript already shows the baseline, and a
+# switch the TUI applies without a confirm dialog is accepted once the command
+# is consumed — the transcript verifies the outcome after the wake either way.
 # Verification truth source: the session transcript (message.model), NOT the
 # statusline — statuslines are user-configurable; toast/label checks are
 # advisory logging only.
-PANE="$1"; SID="$2"; BASELINE="$3"; LABEL="$4"; ATTEMPT="$5"; TMUX_BIN="$6"; STATE="$7"; TRANSCRIPT="$8"
+PANE="$1"; SID="$2"; BASELINE="$3"; LABEL="$4"; ATTEMPT="$5"; TMUX_BIN="$6"; STATE="$7"; TRANSCRIPT="$8"; MODE="${9:-compact}"
 STATE_DIR="$(dirname "$STATE")"; YIELD="$STATE_DIR/yield-$SID"
 log()  { printf '%s [recover-driver] %s\n' "$(date '+%F %T')" "$*"; }
 norm() { "$TMUX_BIN" capture-pane -p -t "$PANE" 2>/dev/null | tr '\302\240' ' '; }
 fg()   { "$TMUX_BIN" display-message -p -t "$PANE" '#{pane_current_command}' 2>/dev/null; }
 set_state() {  # set_state <phase> [note] — note may quote screen content; keep the JSON valid
   local n; n="$(printf '%s' "${2:-}" | tr '\042\134' '\047 ')"
-  printf '{"sid":"%s","pane":"%s","baseline":"%s","label":"%s","attempt":%s,"phase":"%s","note":"%s","ts":"%s"}\n' \
-    "$SID" "$PANE" "$BASELINE" "$LABEL" "$ATTEMPT" "$1" "$n" "$(date '+%FT%T%z')" > "$STATE.tmp" && mv "$STATE.tmp" "$STATE"
+  printf '{"sid":"%s","pane":"%s","baseline":"%s","label":"%s","attempt":%s,"mode":"%s","phase":"%s","note":"%s","ts":"%s"}\n' \
+    "$SID" "$PANE" "$BASELINE" "$LABEL" "$ATTEMPT" "$MODE" "$1" "$n" "$(date '+%FT%T%z')" > "$STATE.tmp" && mv "$STATE.tmp" "$STATE"
 }
 fail() { log "FAIL $1${2:+: $2}"; set_state "FAILED-$1" "${2:-}"; rm -f "$YIELD"; exit 1; }
 alive() {  # pane must exist and still run the TUI (a plain shell = session gone)
@@ -380,8 +409,15 @@ for line in data.splitlines():
 print(out)
 PY
 }
+newest_model() {  # newest assistant model in the transcript (tail window first, whole file as fallback)
+  local size m
+  size="$(wc -c < "$TRANSCRIPT" 2>/dev/null | tr -d ' ')"; size="${size:-0}"
+  m="$(live_model $(( size > 262144 ? size - 262144 : 0 )))"
+  [ -n "$m" ] || m="$(live_model 0)"
+  printf '%s' "$m"
+}
 
-log "armed pane=$PANE sid=$SID baseline=$BASELINE label=${LABEL:-(none)} attempt=$ATTEMPT"
+log "armed pane=$PANE sid=$SID baseline=$BASELINE label=${LABEL:-(none)} attempt=$ATTEMPT mode=$MODE"
 # yield-valve: a session whose Stop hook always blocks never goes idle, so the
 # queued /compact would never drain. Contract: the driver raises this flag; a
 # cooperating Stop hook sees it, deletes it, and lets ONE stop through.
@@ -401,75 +437,104 @@ for _ in $(seq 1 300); do   # up to 10 min — compaction of a large context is 
   [ "$quiet" -ge 3 ] && break
   sleep 2
 done
-[ "$quiet" -ge 3 ] || fail COMPACT_DONE "turn/compaction still busy after 10 min"
-alive COMPACT_DONE
-set_state COMPACT_DONE
-log "compaction finished → staging /model"
+IDLE_PHASE=COMPACT_DONE; [ "$MODE" = switch ] && IDLE_PHASE=TURN_IDLE
+[ "$quiet" -ge 3 ] || fail "$IDLE_PHASE" "turn/compaction still busy after 10 min"
+alive "$IDLE_PHASE"
+set_state "$IDLE_PHASE"
+log "$([ "$MODE" = switch ] && echo 'turn idle' || echo 'compaction finished') → checking the transcript before /model"
 
-# ---- stage + submit /model <baseline> (opens a confirm dialog) ------------
-# Staged via bracketed paste (single event — the command palette opened by the
-# leading "/" cannot swallow same-tick characters), verified, then submitted.
-CMD="/model $BASELINE"
-staged=0
-for i in 1 2 3; do
-  mode_fix
-  f="$(mktemp "${TMPDIR:-/tmp}/cc-self-rcv.XXXXXX")"
-  printf '%s' "$CMD" > "$f"
-  "$TMUX_BIN" load-buffer -b cc-self-rcv "$f"
-  rm -f "$f"
-  "$TMUX_BIN" paste-buffer -p -b cc-self-rcv -t "$PANE"
-  "$TMUX_BIN" delete-buffer -b cc-self-rcv 2>/dev/null
-  sleep 1
-  [ "$(box)" = "$CMD" ] && { staged=1; break; }
-  log "stage attempt $i: box holds '$(box)' — clearing and retrying"
-  "$TMUX_BIN" send-keys -N 80 -t "$PANE" BSpace   # idle here: BSpace is safe, Escape is not
-  sleep 0.5
-done
-[ "$staged" -eq 1 ] || fail MODEL_DIALOG "could not stage $CMD in the input box"
-"$TMUX_BIN" send-keys -t "$PANE" Enter
-set_state MODEL_DIALOG
+# ---- is a switch needed at all? ------------------------------------------
+# The session may already be on the baseline (the user switched /model
+# themselves before the recovery was armed, or the baseline was raised to the
+# model already in use). /model for the model already in use opens NO confirm
+# dialog — treating that as a failure was a false alarm (observed live
+# 2026-09-02: FAILED-MODEL_DIALOG on a session that was already on baseline).
+BASE="${BASELINE%%\[*}"
+pre="$(newest_model)"
+if [ -n "$pre" ] && [ "$pre" = "$BASE" ]; then
+  log "transcript already shows the baseline ($pre) — /model switch skipped"
+  set_state SWITCHED "already on baseline ($pre); switch skipped"
+else
+  # ---- stage + submit /model <baseline> ------------------------------------
+  # Staged via bracketed paste (single event — the command palette opened by the
+  # leading "/" cannot swallow same-tick characters), verified, then submitted.
+  CMD="/model $BASELINE"
+  staged=0
+  for i in 1 2 3; do
+    mode_fix
+    f="$(mktemp "${TMPDIR:-/tmp}/cc-self-rcv.XXXXXX")"
+    printf '%s' "$CMD" > "$f"
+    "$TMUX_BIN" load-buffer -b cc-self-rcv "$f"
+    rm -f "$f"
+    "$TMUX_BIN" paste-buffer -p -b cc-self-rcv -t "$PANE"
+    "$TMUX_BIN" delete-buffer -b cc-self-rcv 2>/dev/null
+    sleep 1
+    [ "$(box)" = "$CMD" ] && { staged=1; break; }
+    log "stage attempt $i: box holds '$(box)' — clearing and retrying"
+    "$TMUX_BIN" send-keys -N 80 -t "$PANE" BSpace   # idle here: BSpace is safe, Escape is not
+    sleep 0.5
+  done
+  [ "$staged" -eq 1 ] || fail MODEL_DIALOG "could not stage $CMD in the input box"
+  "$TMUX_BIN" send-keys -t "$PANE" Enter
+  set_state MODEL_DIALOG
 
-# never press blind: approve only after SEEING the dialog with the expected
-# option highlighted
-seen=0
-for _ in $(seq 1 15); do
-  s="$(norm)"
-  if printf '%s\n' "$s" | grep -q 'Switch model?'; then
-    seen=1
-    printf '%s\n' "$s" | grep -qE '❯ *1\. Yes, switch to' && { seen=2; break; }
+  # A "Switch model?" confirm dialog may or may not follow: the TUI opens one
+  # for a mid-conversation switch but applies others directly (observed live:
+  # the model already in use; TUI builds that confirm nothing). Never press
+  # blind: approve only after SEEING the dialog with the expected option
+  # highlighted. With no dialog, continue only once the command has been
+  # CONSUMED — the input box is visible again and empty a few seconds later —
+  # and let the transcript verify the switch after the wake.
+  seen=0; dialogless=0
+  for i in $(seq 1 15); do
+    s="$(norm)"
+    if printf '%s\n' "$s" | grep -q 'Switch model?'; then
+      seen=1
+      printf '%s\n' "$s" | grep -qE '❯ *1\. Yes, switch to' && { seen=2; break; }
+    elif [ "$seen" -eq 0 ] && [ "$i" -ge 4 ] && printf '%s\n' "$s" | grep -q '^❯' && [ -z "$(box)" ]; then
+      dialogless=1; break
+    fi
+    sleep 1
+  done
+  if [ "$dialogless" -eq 1 ]; then
+    log "no confirm dialog — command consumed, switch applied directly (transcript verifies after the wake)"
+    set_state SWITCHED "no confirm dialog; command consumed — transcript verifies after wake"
+  else
+    if [ "$seen" -ne 2 ]; then
+      if [ "$seen" -eq 1 ]; then
+        "$TMUX_BIN" send-keys -t "$PANE" Escape   # a dialog IS confirmed open — Escape only cancels it
+        fail MODEL_DIALOG "dialog open but 'Yes, switch to' not highlighted"
+      fi
+      # no dialog, and the input box never came back empty: Enter did not
+      # register (command still staged) or the screen is in an unknown state —
+      # typing into it would be blind
+      fail MODEL_DIALOG "no confirm dialog and the input box did not clear (box: '$(box)') — command not consumed"
+    fi
+    "$TMUX_BIN" send-keys -t "$PANE" Enter
+
+    # ---- confirm the Enter registered: the dialog must CLOSE ----------------
+    # TUI signal, independent of any user statusline config. Typing into a
+    # still-open dialog is dangerous (digits select options), so a dialog that
+    # never closes is a hard failure, not something to type past.
+    closed=0
+    for _ in $(seq 1 15); do
+      norm | tail -12 | grep -qE '❯ *1\. Yes, switch to' || { closed=1; break; }
+      sleep 1
+    done
+    [ "$closed" -eq 1 ] || fail SWITCHED "dialog did not close after Enter"
+    # Advisory only (user statuslines vary; the toast wording may change across
+    # TUI versions): note whether a toast/label happened to confirm, never fail.
+    adv="unconfirmed"
+    for _ in $(seq 1 5); do
+      s="$(norm | tail -8)"
+      { [ -n "$LABEL" ] && printf '%s\n' "$s" | grep -qF "[$LABEL]"; } || printf '%s\n' "$s" | grep -q 'Set model to' \
+        && { adv="confirmed"; break; }
+      sleep 1
+    done
+    set_state SWITCHED "dialog approved+closed; toast/statusline advisory: $adv"
+    log "dialog approved and closed (advisory: $adv)"
   fi
-  sleep 1
-done
-if [ "$seen" -ne 2 ]; then
-  if [ "$seen" -eq 1 ]; then
-    "$TMUX_BIN" send-keys -t "$PANE" Escape   # a dialog IS confirmed open — Escape only cancels it
-    fail MODEL_DIALOG "dialog open but 'Yes, switch to' not highlighted"
-  fi
-  fail MODEL_DIALOG "Switch model dialog never appeared"
 fi
-"$TMUX_BIN" send-keys -t "$PANE" Enter
-
-# ---- confirm the Enter registered: the dialog must CLOSE ------------------
-# TUI signal, independent of any user statusline config. Typing into a still-
-# open dialog is dangerous (digits select options), so a dialog that never
-# closes is a hard failure, not something to type past.
-closed=0
-for _ in $(seq 1 15); do
-  norm | tail -12 | grep -qE '❯ *1\. Yes, switch to' || { closed=1; break; }
-  sleep 1
-done
-[ "$closed" -eq 1 ] || fail SWITCHED "dialog did not close after Enter"
-# Advisory only (user statuslines vary; the toast wording may change across
-# TUI versions): note whether a toast/label happened to confirm, never fail.
-adv="unconfirmed"
-for _ in $(seq 1 5); do
-  s="$(norm | tail -8)"
-  { [ -n "$LABEL" ] && printf '%s\n' "$s" | grep -qF "[$LABEL]"; } || printf '%s\n' "$s" | grep -q 'Set model to' \
-    && { adv="confirmed"; break; }
-  sleep 1
-done
-set_state SWITCHED "dialog approved+closed; toast/statusline advisory: $adv"
-log "dialog approved and closed (advisory: $adv)"
 
 # ---- wake the session, then verify against the TRANSCRIPT (truth source) ---
 # The switch's real effect is the model of the NEXT turn. The transcript
@@ -484,7 +549,6 @@ mode_fix
 "$TMUX_BIN" send-keys -t "$PANE" -l -- "[cc-self recover] attempt $ATTEMPT: model switched, verify guard silence and report"
 sleep 0.5
 "$TMUX_BIN" send-keys -t "$PANE" Enter
-BASE="${BASELINE%%\[*}"
 verdict=""
 for _ in $(seq 1 90); do   # up to 3 min for the wake turn's first assistant message
   m="$(live_model "$OFF0")"
@@ -510,9 +574,16 @@ else
 fi
 RCV
     chmod +x "$RDRIVER"
-    tmux run-shell -b "/bin/bash '$RDRIVER' '$PANE' '$SID' '$BASELINE' '$LABEL' '$ATTEMPT' '$TMUX_BIN' '$STATE' '$TRANSCRIPT' >> '$LOG' 2>&1"
-    logit "recover: armed sid=$SID baseline=$BASELINE label=${LABEL:-?} attempt=$ATTEMPT compact=${PASTE_BYTES}B"
-    echo "recover armed (attempt $ATTEMPT): /compact queued (${PASTE_BYTES}B) — end the turn now; driver: compaction → /model $BASELINE → dialog → wake → transcript-verify (state: $STATE, log: $LOG)"
+    # `|| true`: see the waker — a failing driver must not take over the
+    # user's screen with tmux's "returned 1" view pane; FAILED-<phase> is in
+    # the state file and the log already
+    tmux run-shell -b "/bin/bash '$RDRIVER' '$PANE' '$SID' '$BASELINE' '$LABEL' '$ATTEMPT' '$TMUX_BIN' '$STATE' '$TRANSCRIPT' '$MODE' >> '$LOG' 2>&1 || true"
+    logit "recover: armed sid=$SID baseline=$BASELINE label=${LABEL:-?} attempt=$ATTEMPT mode=$MODE compact=${PASTE_BYTES}B"
+    if [ "$MODE" = switch ]; then
+      echo "recover armed (attempt $ATTEMPT, plain switch — no compaction): end the turn now; driver: turn idle → /model $BASELINE → dialog if any → wake → transcript-verify (state: $STATE, log: $LOG)"
+    else
+      echo "recover armed (attempt $ATTEMPT): /compact queued (${PASTE_BYTES}B) — end the turn now; driver: compaction → /model $BASELINE → dialog if any → wake → transcript-verify (state: $STATE, log: $LOG)"
+    fi
     ;;
   restart)
     # The session's own death kills its Bash tool too, so the restart
@@ -651,7 +722,7 @@ tui_type '[cc-self restart driver] Automated restart sequence complete. Verify s
 log "wake-up message sent — driver done"
 DRV
     chmod +x "$DRIVER"
-    tmux run-shell -b "/bin/bash '$DRIVER' '$PANE' '$SID' '$CLAUDE_BIN' '$TMUX_BIN' '$MODEL' '$EFFORT' '$EXTRA' >> '$LOG' 2>&1"
+    tmux run-shell -b "/bin/bash '$DRIVER' '$PANE' '$SID' '$CLAUDE_BIN' '$TMUX_BIN' '$MODEL' '$EFFORT' '$EXTRA' >> '$LOG' 2>&1 || true"
     logit "restart: sid=$SID bin=$CLAUDE_BIN model=${MODEL:-?} effort=${EFFORT:-?}${EXTRA:+ extra=$EXTRA}"
     echo "restart driver armed — after this turn ends: /exit → resume pinning model=${MODEL:-default} effort=${EFFORT:-default}${EXTRA:+ + $EXTRA} (log: $LOG)"
     ;;

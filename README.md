@@ -36,14 +36,23 @@ a process that survives its own death (used for restart).
 - **`model-recovery` skill + `model-guard` hook + `cc-self recover`**:
   deterministic recovery from model safety-fallbacks. The bundled hook
   re-flags on every run while the session runs below the baseline declared in
-  `~/.claude/settings.json`, embedding the exact recovery step. The model's
+  `~/.claude/settings.json`, embedding the exact recovery step (and stays
+  silent when no `model` is declared there — the default-model setting leaves
+  no baseline to be below). The model's
   only job is writing a compact instruction file (preserve context, abstract
   the trigger content); `cc-self recover` then submits `/compact` and a
   detached driver waits out the compaction, switches `/model` back, approves
-  the confirm dialog only after seeing it, wakes the session, and verifies the
-  live model from the session transcript (statuslines are user-configurable,
-  so screen checks are advisory only) — a state machine with per-session state
-  in `~/.cc-self/state/recover-<sid>.json`, no blind keypress at any step.
+  the confirm dialog only after seeing it (a switch the TUI applies without a
+  dialog is accepted once the command is consumed), wakes the session, and
+  verifies the live model from the session transcript (statuslines are
+  user-configurable, so screen checks are advisory only) — a state machine
+  with per-session state in `~/.cc-self/state/recover-<sid>.json`, no blind
+  keypress at any step. The guard tells a session that FELL from the baseline
+  (compact-first) apart from one that merely STARTED below it — e.g. the
+  baseline was raised to a newer release after launch — which gets a plain
+  `cc-self recover --switch-only` first, and it treats a record older than
+  the current settings.json (the user just ran `/model`) as stale rather than
+  as a fallback.
   Sessions with an always-blocking Stop hook integrate via the yield-valve
   flag (`~/.cc-self/state/yield-<sid>`, see the model-recovery skill). If an
   external copy of the guard also runs, keep only one enabled
