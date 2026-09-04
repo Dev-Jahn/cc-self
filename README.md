@@ -36,7 +36,9 @@ a process that survives its own death (used for restart).
 - **`model-recovery` skill + `model-guard` hook + `cc-self recover`**:
   deterministic recovery from model safety-fallbacks. The bundled hook
   re-flags on every run while the session runs below the baseline declared in
-  `~/.claude/settings.json`, embedding the exact recovery step. The model's
+  `~/.claude/settings.json`, embedding the exact recovery step (and stays
+  silent when no `model` is declared there — the default-model setting leaves
+  no baseline to be below). The model's
   only job is writing a compact instruction file (preserve context, abstract
   the trigger content); `cc-self recover` then submits `/compact` and a
   detached driver waits out the compaction, switches `/model` back, approves

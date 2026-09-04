@@ -74,11 +74,20 @@ def state_path(transcript):
 def declared_baseline_full():
     # The model the session DECLARES it is, read from settings.json (`model`,
     # e.g. "claude-fable-5[1m]"). Full string — this is what /model gets.
+    #
+    # Returns None when there is NO declaration to compare against: the key is
+    # absent (the user picked the "default" model, which removes it), it is
+    # empty, or settings.json cannot be read. This used to fall back to a
+    # hardcoded model id, which turned "no baseline declared" into "you fell
+    # back from <that id>" — a permanent false alarm on every hook firing, with
+    # a recovery ladder aimed at a model the user never asked for. Observed
+    # live 2026-09-04: /model set to "default" dropped the key and an Opus 5
+    # session was flagged as a fallen-back Fable 5 on every run.
     try:
         s = json.load(open(SETTINGS))
-        return (s.get("model") or "").strip() or "claude-fable-5"
     except Exception:
-        return "claude-fable-5"
+        return None
+    return (s.get("model") or "").strip() or None
 
 
 def settings_mtime():
@@ -363,6 +372,11 @@ def main():
         sys.exit(0)
 
     baseline_full = declared_baseline_full()
+    if not baseline_full:
+        # No declared baseline (default model, or unreadable settings): there
+        # is nothing to be off OF, so the guard has no claim to make. Silence
+        # is the only correct output — never invent a baseline.
+        sys.exit(0)
     baseline = strip_ctx(baseline_full)
     spath = state_path(transcript)
     st = load_state(spath)

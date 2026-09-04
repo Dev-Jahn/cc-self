@@ -33,6 +33,11 @@ the current baseline declaration itself (settings.json written after it —
 the user just ran `/model`; the next assistant record settles it). Never arm
 anything from a note marked stale.
 
+The guard is **silent when no baseline is declared** — `model` absent from
+`~/.claude/settings.json` (what `/model` writes when you pick the default
+model), empty, or the file unreadable. There is nothing to be below, so no
+note appears; if you want the guard active, declare an explicit `model`.
+
 ## Why compact-first, not a bare /model switch
 
 A direct `/model <baseline>` switch does **not** hold while the context still
