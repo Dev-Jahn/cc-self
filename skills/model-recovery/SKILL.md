@@ -1,6 +1,6 @@
 ---
 name: model-recovery
-description: This skill should be used when a "[model-guard]" note reports the session is running below its declared baseline model (e.g. "running as Opus 4.8, not the Fable 5 your system prompt declares"), when the user asks to "recover the model", "switch back to the baseline model", "restore Fable 5", or after a "[cc-self recover]" verification wake message arrives. Runs the deterministic compact-first recovery built into cc-self.
+description: This skill should be used when a "[model-guard]" note reports the session is running below its declared baseline model (e.g. "This session runs as Opus 4.8 … Declared baseline: Fable 5"), when the user asks to "recover the model", "switch back to the baseline model", "restore Fable 5", or after a "[cc-self recover]" verification wake message arrives. Runs the deterministic compact-first recovery built into cc-self.
 version: 1.4.0
 ---
 
@@ -9,10 +9,22 @@ version: 1.4.0
 ## When
 
 The bundled `model-guard` hook injects a `[model-guard]` note on every run
-while the session's actual runtime model (transcript truth) is below the
-baseline declared in `~/.claude/settings.json` (`model`). If the fallback
-happened during legitimate work — a broad safeguard over-triggering — recover
-with the procedure below. The note itself carries the attempt number to use.
+while the session's actual runtime model (transcript truth) differs from the
+declared baseline: `CC_SELF_BASELINE` in the session's environment, else
+`model` in `~/.claude/settings.json` (an alias such as `sonnet`, a dated
+snapshot and the bare id all name the same model). With neither declared
+there is no baseline — the guard then reports a model transition once and
+instructs nothing (no built-in default). The note names its baseline's source and
+states whether the guard ever saw the session on that baseline: a mid-session
+move away from it is what a fallback looks like, while a session the guard
+never saw on the baseline may have been launched on another model on
+purpose — then the note's instruction is conditional, and the right fix is
+for the user to declare that model (`CC_SELF_BASELINE=<id>` at launch, or pin
+settings.json), not to "recover" and not to edit the declaration yourself.
+Once a recovery has been armed for the session, the baseline counts as the
+operator's stated intent. If the fallback happened during legitimate work — a broad
+safeguard over-triggering — recover with the procedure below. The note itself
+carries the attempt number to use.
 
 ## Why compact-first, not a bare /model switch
 
@@ -68,7 +80,9 @@ normalized to single quotes). The instructions must:
 bash <plugin-root>/scripts/cc-self recover --compact-file <path> --attempt <N>
 ```
 
-`--baseline` defaults to `model` in `~/.claude/settings.json`. Then **end the
+`--baseline` defaults to `CC_SELF_BASELINE` (own session only), then `model`
+in `~/.claude/settings.json`; with neither declared `recover` refuses (nothing
+to recover to). Then **end the
 turn promptly** — the queued `/compact` only drains when the turn ends (the
 driver waits as long as the TUI is alive, up to 90 minutes, but every extra
 tool call delays the recovery). `cc-self recover --status` shows the state
@@ -166,4 +180,7 @@ external copy of the guard also runs (e.g. a personal ops script), keep only
 ONE enabled or every run gets duplicate notes — disable the bundled one by
 creating `~/.cc-self/state/guard-disabled`, or retire the external one. A
 single session can opt out by being launched with `CC_SELF_GUARD_DISABLED=1`
-(used by cc-self's own scratch-session tests).
+(used by cc-self's own scratch-session tests), and a session deliberately run
+on another model than the machine-wide default declares it with
+`CC_SELF_BASELINE=<model>` at launch (hooks inherit the environment; `cc-self
+restart` carries both variables onto the relaunch).

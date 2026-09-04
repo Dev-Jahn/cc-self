@@ -59,6 +59,10 @@ resumed session reports back.
   typed, because the resume command lands in a live zsh where a bare `[1m]`
   is a glob ("no matches found" and the relaunch never runs). Pass raw values
   after `--`; the driver quotes each token itself.
+- Per-session cc-self declarations (`CC_SELF_BASELINE`, `CC_SELF_GUARD_DISABLED`)
+  are read from the session's environment at arm time and typed as an
+  assignment prefix on the resume command, so the relaunched process keeps
+  them (self only; a `--pane` target's environment is unknown to us).
 - The driver preserves permission mode: it adds `--dangerously-skip-permissions`
   only if the footer showed "bypass permissions on" before exiting.
 - If background tasks are running, `/exit` opens a "Background work is running"

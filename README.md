@@ -33,10 +33,18 @@ a process that survives its own death (used for restart).
   command (`--model`/`--effort`) so effort survives the restart and the
   prompt cache stays warm; `restart <sid> -- <flags>` appends extra resume
   flags verbatim (replacing the pinned ones they name, e.g. `-- --effort max`).
+  `CC_SELF_BASELINE` / `CC_SELF_GUARD_DISABLED` from the session's environment
+  are carried onto the relaunch (own session only), so per-session
+  declarations survive it.
 - **`model-recovery` skill + `model-guard` hook + `cc-self recover`**:
   deterministic recovery from model safety-fallbacks. The bundled hook
-  re-flags on every run while the session runs below the baseline declared in
-  `~/.claude/settings.json`, embedding the exact recovery step. The model's
+  re-flags on every run while the session's runtime model differs from its
+  declared baseline (`CC_SELF_BASELINE` in the session's environment, else `model` in
+  `~/.claude/settings.json`; nothing declared means no baseline, so the guard
+  then only reports model transitions and instructs nothing — there is no
+  built-in default; ids, dated snapshots and aliases such as `sonnet` compare
+  by model family). Every note names the baseline's source and whether the
+  guard ever saw the session on it, and embeds the exact recovery step. The model's
   only job is writing a compact instruction file (preserve context, abstract
   the trigger content); `cc-self recover` then submits `/compact` and a
   detached driver waits out the compaction (transcript truth: the
