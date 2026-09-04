@@ -231,13 +231,20 @@ tui_alive() {
   ps -A -o pid=,ppid=,args= 2>/dev/null | awk -v root="$root" '
     { n=split($0, a, " "); par[a[1]]=a[2]; exe[a[1]]=(n>=3?a[3]:""); arg[a[1]]=(n>=4?a[4]:"") }
     END {
+      proc = (system("test -r /proc/self/exe") == 0)
       q[0]=root; seen[root]=1; head=0; tail=1; found=0
       while (head<tail) {
-        p=q[head++]; e=exe[p]; sub(/.*\//, "", e); ar=arg[p]
-        # the executable itself is claude (symlink or versioned binary), or a
-        # node/bun runtime whose script is the claude CLI — not any process
-        # that merely mentions "claude" in an argument (cat ~/.claude/…)
-        if (e == "claude" || exe[p] ~ /\/claude\/versions\// ||
+        p=q[head++]; x=exe[p]; ar=arg[p]
+        # Identity = the executable, resolved by the kernel where the OS gives
+        # it away for free (/proc/PID/exe on Linux; argv[0] can be anything —
+        # exec -a), else the executable as invoked (argv[0]). Never a substring
+        # of the whole command line, and only inside this pane tree: a process
+        # that merely mentions claude in an argument (cat ~/.claude/x) is not
+        # the TUI. On macOS the native binary is really ~/.claude/versions/N.N.N
+        # (kernel basename = the version), hence the versions-path rule.
+        if (proc) { cmd="readlink /proc/" p "/exe 2>/dev/null"; r=""; if ((cmd | getline r) > 0 && r != "") { sub(/ \(deleted\)$/, "", r); x=r }; close(cmd) }
+        e=x; sub(/.*\//, "", e)
+        if (e == "claude" || x ~ /\/claude\/versions\// ||
             ((e ~ /^(node|bun)/) && (ar ~ /(^|\/)claude$|claude-code|\/cli\.js$/))) found=1
         for (c in par) if (par[c]==p && !seen[c]) { seen[c]=1; q[tail++]=c }
       }

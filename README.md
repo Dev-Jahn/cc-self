@@ -84,7 +84,10 @@ a process that survives its own death (used for restart).
 - Idle/turn-end detection does not depend on TUI wording (which changes
   between versions): the conversation area above the input box must stop
   changing, with no dialog up. TUI liveness is checked from the pane's
-  process tree, not `pane_current_command` (a wrapper shell hides the TUI).
+  process tree, not `pane_current_command` (a wrapper shell hides the TUI),
+  and a process counts by its executable (kernel-resolved via `/proc` on
+  Linux, argv[0] elsewhere) or, for a node/bun runtime, by its script
+  argument — never by a substring of some command line.
 - Every send is appended to `~/.cc-self.log` for audit.
 
 Intended for trusted, self-administered machines (personal agent hosts).
