@@ -664,6 +664,12 @@ def main():
         obs = (f"[model-guard] This session runs as {live_name} (id {live}, "
                f"from this session's transcript).")
     obs += f" Declared baseline: {base_name} ({baseline_full}, from {source})."
+    # The reading model dismissed a real fallback for several turns because
+    # its system prompt still named the launch model (b200 ink, 2026-09-07):
+    # say where the truth lives, so the note cannot be argued away with it.
+    obs += (" A system prompt naming another model is not counter-evidence: "
+            "it describes the launch, while the transcript's per-record "
+            "`model` field is what the API actually answered with.")
     if stale_reading(rec, live_ts):
         # The reading predates a just-completed switch: state the two facts
         # and the staleness, interpret nothing.

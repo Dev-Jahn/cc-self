@@ -33,7 +33,7 @@ expect "If this is a fallback and not a deliberate choice, recover now (attempt 
 silent "C CC_SELF_BASELINE beats settings" "$(CC_SELF_BASELINE='claude-sonnet-5' out "$S/b2.jsonl")"
 expect "from CC_SELF_BASELINE" "$(CC_SELF_BASELINE=claude-fable-5 ev "$S/b2.jsonl" PostToolUse)" "F source named"
 set_base 'claude-fable-5-1[1m]'; rec claude-fable-5-1 1 > "$S/d.jsonl"; silent "D1 on baseline" "$(out "$S/d.jsonl")"
-rec claude-opus-5 2 >> "$S/d.jsonl"; o="$(out "$S/d.jsonl")"; expect "saw the session on Fable 5.1 before" "$o" "D2 switched away"; expect "Recover now (attempt 1)" "$o" "D3 unconditional"
+rec claude-opus-5 2 >> "$S/d.jsonl"; o="$(out "$S/d.jsonl")"; expect "saw the session on Fable 5.1 before" "$o" "D2 switched away"; expect "Recover now (attempt 1)" "$o" "D3 unconditional"; expect "system prompt naming another model is not counter-evidence" "$o" "D4 truth lives in the transcript, not the system prompt"
 printf 'claude-fable-5-1' > "$S/.cc-self/state/model-guard.e.state"; rec claude-opus-5 1 > "$S/e.jsonl"; expect "saw the session on Fable 5.1" "$(out "$S/e.jsonl")" "E 1.3.x bare-id state"
 printf '{"last":"claude-fable-5-1","seen_on":"claude-fable-5-1"}' > "$S/.cc-self/state/model-guard.e2.state"; rec claude-opus-5 1 > "$S/e2.jsonl"; expect "saw the session on Fable 5.1" "$(out "$S/e2.jsonl")" "E2 1.4.0 string seen_on"
 echo '# model families'
