@@ -44,10 +44,13 @@ a process that survives its own death (used for restart).
   then only reports model transitions and instructs nothing — there is no
   built-in default; ids, dated snapshots and aliases such as `sonnet` compare
   by model family). A fallback only ever goes down, so a session above its
-  baseline is never flagged. A `/model` typed in the session, once the next
-  assistant record confirms it, is the newest declaration and becomes the
-  session's baseline (over `CC_SELF_BASELINE`; over settings.json unless that
-  was written later), so a later fallback recovers to the chosen model. Every note names the
+  baseline is never flagged, though a downward move from a model the session
+  ran on is reported once. A `/model` the user types in the session, once the
+  first assistant record after it confirms it, is the newest declaration and
+  becomes the session's baseline (over `CC_SELF_BASELINE` when typed after
+  this launch; over settings.json unless that was written later), so a later
+  fallback recovers to the chosen model. A `/model` that cc-self itself typed
+  is a switch, never a declaration. Every note names the
   baseline's source and whether the guard ever saw the session on it, and
   embeds the exact recovery step (in full on every prompt and every 10th tool
   call, one line in between). The model's

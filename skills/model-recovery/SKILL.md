@@ -23,15 +23,19 @@ for the user to declare that model (`CC_SELF_BASELINE=<id>` at launch, or pin
 settings.json), not to "recover" and not to edit the declaration yourself.
 Once a recovery has been armed for the session, the baseline counts as the
 operator's stated intent. A live model that outranks the baseline is never
-flagged (a fallback only goes down). A `/model` typed in this session, once
-the next assistant record confirms it, is the newest declaration and becomes
-the session's baseline (over `CC_SELF_BASELINE`; over settings.json unless
-that was written later) — a later fallback then recovers to the chosen model,
-and the note's command names it with `--baseline`. So a `/model` you type on
-yourself is a declaration, never a way around a recovery: type it only on the
-user's instruction. A `/model` newer than the last assistant record means the
-runtime is still settling: the note says so and instructs nothing. Recover
-records older than a day are ignored. If the fallback happened during legitimate work — a broad
+flagged (a fallback only goes down), though a downward move from a model the
+session ran on is reported once, instructing nothing. A `/model` the user
+types in this session, once the first assistant record after it confirms it,
+is the newest declaration and becomes the session's baseline (over
+`CC_SELF_BASELINE` when typed after this process launched; over settings.json
+unless that was written later) — a later fallback then recovers to the chosen
+model, and the note's command names it with `--baseline`. A `/model` that
+cc-self typed (`cc-self type`, the recover driver) is a switch, never a
+declaration: the session cannot declare its own baseline, so typing `/model`
+on yourself is never a way around a recovery. A `/model` newer than the last
+assistant record means the runtime is still settling: the note says so and
+instructs nothing. Recover records older than a day are ignored, except a
+CLOSED one, which stays the operator's decision. If the fallback happened during legitimate work — a broad
 safeguard over-triggering — recover with the procedure below. The note itself
 carries the attempt number to use.
 

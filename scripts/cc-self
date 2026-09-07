@@ -154,6 +154,13 @@ gc_state() {  # age-based GC: states of long-gone sessions, stale yield flags
   find "$STATE_DIR" -name 'restart-*.json' -mtime +7 -delete 2>/dev/null
   find "$STATE_DIR" -name 'recover-*-screen.txt' -mtime +7 -delete 2>/dev/null
   find "$STATE_DIR" -name 'yield-*' -mtime +1 -delete 2>/dev/null
+  find "$STATE_DIR" -name 'model-sends-*' -mtime +7 -delete 2>/dev/null
+}
+# note_model_send <sid> <text>: a /model that cc-self types is a real switch
+# but never a declaration of the session's baseline — the guard hook reads
+# this file to tell it from a /model the user typed (same transcript record).
+note_model_send() {
+  case "$2" in "/model"|"/model "*) printf '%s %s\n' "$(date +%s)" "$2" >> "$STATE_DIR/model-sends-$1" ;; esac
 }
 
 settings_model() {  # machine-wide declared model, e.g. claude-fable-5[1m]
@@ -484,6 +491,9 @@ case "$CMD" in
       TEXT="$*"
     fi
     warn_inflight
+    case "${TEXT:-$(head -c 7 "$FROM" 2>/dev/null)}" in "/model"|"/model "*)
+      SID="$(resolve_sid)"; [ -n "$SID" ] && note_model_send "$SID" "${TEXT:-$(head -1 "$FROM")}" ;;
+    esac
     if [ "$PASTE" -eq 1 ]; then
       # Bracketed paste: the TUI receives the text as one paste event, so
       # nothing is interpreted per-keystroke — no command-palette race on a
@@ -764,6 +774,7 @@ wait_idle 600; rc=$?
 CMD="/model $BASELINE"
 stage_exact "$CMD" || fail SWITCH_SUBMITTED "could not stage '$CMD' in the input box (box: '$(box)')"
 ok0="$(screen_count "$SWITCH_OK_RE" 25)"; err0="$(screen_count "$SWITCH_ERR_RE" 25)"
+printf '%s %s\n' "$(date +%s)" "$CMD" >> "$(dirname "$STATE")/model-sends-$SID"   # cc-self typed it: a switch, not a declaration (guard reads this)
 "$TMUX_BIN" send-keys -t "$PANE" Enter
 set_state SWITCH_SUBMITTED
 # Outcomes, observed rather than assumed:

@@ -42,11 +42,18 @@ Three more things the guard observes rather than infers: a safety fallback only
 ever goes DOWN, so a live model that outranks the declared baseline (Fable over
 Opus, 5.1 over 5) is never flagged; a `/model` command typed in this session
 (the transcript records it, with its argument or the "Set model to `X`" echo)
-whose choice the next assistant record confirms becomes the session's baseline
-— the newest declaration wins: a confirmed in-session /model over
-CC_SELF_BASELINE, and over settings.json unless settings.json was written
-later — and a `/model` newer than the last assistant record means the runtime
-is still settling. Off-baseline notes repeat on every prompt and every 10th tool call
+whose choice the first assistant record after it confirms becomes the
+session's baseline — the newest declaration wins: a confirmed in-session
+/model over CC_SELF_BASELINE when typed after this process launched (the
+SessionStart hook stamps the launch; a --resume replays older /model records
+that must not beat today's launch declaration), and over settings.json
+unless settings.json was written later. A /model that cc-self itself typed
+(`cc-self type`, the recover driver; recorded in
+~/.cc-self/state/model-sends-<sid>) is a real switch but never a declaration
+— the session cannot declare its own baseline. A `/model` newer than the last
+assistant record means the runtime is still settling. A downward move from a
+model the session was seen on is reported once even above the baseline
+(that is what a fallback looks like), instructing nothing. Off-baseline notes repeat on every prompt and every 10th tool call
 in full (in between, one line), and a recover state older than a day is
 ignored — a --resume keeps a session id for weeks.
 """
@@ -78,6 +85,8 @@ FULL_NOTE_EVERY = 10
 INFLIGHT = ("ARMED", "COMPACT_SUBMITTED", "COMPACT_DONE", "SWITCH_SUBMITTED", "MODEL_DIALOG")
 LANDED = ("SWITCHED", "VERIFY_WAKE", "DONE")
 FAMILY_RANK = {"haiku": 1, "sonnet": 2, "opus": 3, "fable": 4}
+# A /model record this close (seconds) to a cc-self send was typed by cc-self.
+AGENT_TYPED_WINDOW = 15
 
 
 def state_path(transcript):
@@ -199,6 +208,22 @@ def model_command(transcript_path, tail_bytes=2_097_152):
     return None
 
 
+def agent_typed(key, ts):
+    """True when cc-self itself typed a /model at about this time into this
+    session (scripts/cc-self appends "<epoch> <text>" to model-sends-<sid>)."""
+    try:
+        with open(os.path.join(STATE_DIR, f"model-sends-{key}")) as f:
+            for line in f:
+                try:
+                    if abs(float(line.split(None, 1)[0]) - ts) <= AGENT_TYPED_WINDOW:
+                        return True
+                except Exception:
+                    continue
+    except Exception:
+        pass
+    return False
+
+
 def chosen_is(chosen, live):
     """Does a /model choice (argument or echoed label) name the live model?"""
     if same_model(chosen, live):
@@ -284,7 +309,8 @@ def recover_state(key):
     # A --resume keeps the session id for weeks: a record from days ago says
     # nothing about today's runtime (found live by clawd: a five-day-old DONE
     # turned a fresh reading into "fell back again, attempt 5").
-    if time.time() - st["_mtime"] > REC_MAX_AGE_SECS and not driver_alive(st):
+    if (time.time() - st["_mtime"] > REC_MAX_AGE_SECS and st.get("phase") != "CLOSED"
+            and not driver_alive(st)):
         return None
     return st
 
@@ -296,7 +322,11 @@ def rec_fresh(rec):
         return False
     if driver_alive(rec):
         return True
-    window = INFLIGHT_FRESH_SECS if int(rec.get("pid", 0) or 0) > 0 else 120
+    try:
+        pid = int(rec.get("pid", 0) or 0)
+    except Exception:
+        pid = 0
+    window = INFLIGHT_FRESH_SECS if pid > 0 else 120
     return time.time() - rec.get("_mtime", 0) < window
 
 
@@ -328,9 +358,10 @@ def driver_alive(rec):
 def load_state(path):
     """{"last": newest model seen, "seen_on": every baseline this session was
     observed running on, "runs": consecutive off-baseline runs, "choice": the
-    newest /model seen}. 1.3.x state files hold a bare model id; 1.4.0 held a
-    single seen_on string."""
-    st = {"last": None, "seen_on": [], "runs": 0, "choice": None}
+    newest /model seen, "sig": what the last full note was about,
+    "launch_ts": when this process started}. 1.3.x state files hold a bare
+    model id; 1.4.0 held a single seen_on string."""
+    st = {"last": None, "seen_on": [], "runs": 0, "choice": None, "sig": None, "launch_ts": None}
     try:
         raw = open(path).read().strip()
     except Exception:
@@ -347,7 +378,23 @@ def load_state(path):
             st["seen_on"] = [x.strip() for x in v if isinstance(x, str) and x.strip()]
             st["runs"] = int(d.get("runs") or 0) if str(d.get("runs") or 0).isdigit() else 0
             ch = d.get("choice")
-            st["choice"] = ch if isinstance(ch, dict) and "ts" in ch else None
+            if isinstance(ch, dict):
+                try:
+                    ts = float(ch.get("ts"))
+                except Exception:
+                    ts = 0.0
+                if 0 < ts <= time.time() + 600:
+                    ch = {k: ch.get(k) for k in ("ts", "chosen", "model", "full", "checked", "agent")}
+                    ch["ts"] = ts
+                    ch["chosen"] = ch["chosen"] if isinstance(ch["chosen"], str) else ""
+                    if not (isinstance(ch["model"], str) and isinstance(ch["full"], str) and ch["model"]):
+                        ch["model"] = ch["full"] = None
+                    st["choice"] = ch
+            st["sig"] = d.get("sig") if isinstance(d.get("sig"), str) else None
+            try:
+                st["launch_ts"] = float(d.get("launch_ts")) if d.get("launch_ts") else None
+            except Exception:
+                st["launch_ts"] = None
             return st
     except Exception:
         pass
@@ -360,7 +407,7 @@ def save_state(path, st):
         os.makedirs(os.path.dirname(path), exist_ok=True)
         tmp = f"{path}.{os.getpid()}.tmp"
         with open(tmp, "w") as f:
-            f.write(json.dumps({k: st.get(k) for k in ("last", "seen_on", "runs", "choice")}))
+            f.write(json.dumps({k: st.get(k) for k in ("last", "seen_on", "runs", "choice", "sig", "launch_ts")}))
         os.replace(tmp, path)
     except Exception:
         pass
@@ -475,6 +522,16 @@ def main():
             inp = {}
     transcript = inp.get("transcript_path") or (sys.argv[1] if len(sys.argv) > 1 else None)
     event = inp.get("hook_event_name", "manual")
+    if event == "SessionStart":
+        # Stamp the launch of this process (not a compaction): a /model typed
+        # before it (replayed by --resume) must not beat this launch's
+        # CC_SELF_BASELINE.
+        if transcript and inp.get("source") in ("startup", "resume", "clear"):
+            spath = state_path(transcript)
+            st = load_state(spath)
+            st["launch_ts"] = time.time()
+            save_state(spath, st)
+        sys.exit(0)
     # Transcript truth only: the hook input's `model` (SessionStart) is the
     # CONFIGURED model, not what the API actually answered with.
     live, live_ts = (None, None)
@@ -500,26 +557,45 @@ def main():
     # baseline — over CC_SELF_BASELINE (launch time), and over settings.json
     # unless settings.json was written after it.
     cmd = model_command(transcript) if transcript else None
-    if cmd and cmd[0] and (not st["choice"] or cmd[0] > float(st["choice"].get("ts") or 0)):
-        st["choice"] = {"ts": cmd[0], "chosen": cmd[1]}
-        log_event(key, last, live, f"{event} /model {cmd[1] or '(picker)'}")
+    if cmd and 0 < cmd[0] <= time.time() + 600 and (not st["choice"] or cmd[0] > st["choice"]["ts"]):
+        st["choice"] = {"ts": cmd[0], "chosen": cmd[1], "model": None, "full": None,
+                        "checked": False, "agent": agent_typed(key, cmd[0])}
+        log_line(key, f"/model typed{' by cc-self' if st['choice']['agent'] else ''}: "
+                      f"{cmd[1] or '(picker)'} event={event}")
     choice = st["choice"] or {}
-    pending = bool(choice and live_ts is not None and float(choice.get("ts") or 0) > live_ts)
-    if (choice.get("chosen") and not choice.get("model") and not pending
-            and chosen_is(choice["chosen"], live)):
-        sm, _ = settings_model()
-        choice["model"] = live
-        choice["full"] = (sm if sm and same_model(sm, live) else
-                          choice["chosen"] if same_model(choice["chosen"], live) else live)
+    pending = bool(choice and live_ts is not None and choice["ts"] > live_ts)
+    if choice and not pending and not choice.get("checked"):
+        # First assistant record after the /model: confirm the choice now or
+        # never. A /model cc-self typed is a switch, not a declaration.
+        choice["checked"] = True
+        if choice.get("chosen") and not choice.get("agent") and chosen_is(choice["chosen"], live):
+            sm, _ = settings_model()
+            choice["model"] = live
+            if sm and same_model(sm, live):
+                choice["full"] = sm
+            elif same_model(choice["chosen"], live):
+                choice["full"] = choice["chosen"]
+            else:
+                choice["full"] = live + ("[1m]" if "(1M context)" in choice["chosen"] else "")
         st["choice"] = choice
-    if choice.get("model") and (declared_ts is None or float(choice.get("ts") or 0) >= declared_ts):
-        baseline_full, source = choice["full"], "/model in this session"
+    # Effective baseline: a confirmed choice is the newest declaration when
+    # it is newer than the one it would replace — settings.json by mtime,
+    # CC_SELF_BASELINE by this process's launch (unknown launch: env wins).
+    base_cmp = None
+    if choice.get("model"):
+        newer = (choice["ts"] >= declared_ts if declared_ts is not None
+                 else bool(st["launch_ts"] and choice["ts"] >= st["launch_ts"]))
+        if baseline_full is None or newer:
+            baseline_full, source = choice["full"], "/model in this session"
+            base_cmp = choice["model"]   # the exact id it was confirmed as
     baseline = baseline_full.split("[")[0].strip() if baseline_full else None
+    if base_cmp is None:
+        base_cmp = baseline
     # "Seen on the baseline" is this guard's own observation: the previous
     # run's reading (covers 1.3.x bare-id state files) or this one.
-    if baseline and (same_model(baseline, last) or same_model(baseline, live)):
-        if not any(same_model(baseline, x) for x in st["seen_on"]):
-            st["seen_on"].append(baseline)
+    if base_cmp and (same_model(base_cmp, last) or same_model(base_cmp, live)):
+        if not any(same_model(base_cmp, x) for x in st["seen_on"]):
+            st["seen_on"].append(base_cmp)
 
     def finish():
         save_state(spath, st)
@@ -540,9 +616,22 @@ def main():
         finish()
 
     # Silent on the declared baseline — and above it: a safety fallback only
-    # ever goes down, so a session on a higher model is not one.
-    if same_model(baseline, live) or above_baseline(live, baseline):
+    # ever goes down, so a session on a higher model is not one. A downward
+    # move from a model this session ran on is still what a fallback looks
+    # like: report it once, instruct nothing.
+    if same_model(base_cmp, live) or above_baseline(live, base_cmp):
         st["runs"] = 0
+        landed_on_choice = bool(choice.get("model") and same_model(choice["model"], live))
+        if (changed and not landed_on_choice
+                and rank(last) and rank(live) and rank(last) > rank(live)):
+            emit(event, (
+                f"[model-guard] Runtime model moved down: {model_label(last)} → "
+                f"{live_name} (id {live}), read from this session's transcript. "
+                f"This is still at or above the declared baseline "
+                f"({model_label(base_cmp)}, from {source}), so no recovery "
+                f"is instructed; if this session was meant to stay on "
+                f"{model_label(last)}, that is a declaration for the user to "
+                f"make. Do not claim to be {model_label(last)}."))
         finish()
     # A /model newer than the last assistant record: the runtime is settling.
     if pending:
@@ -560,21 +649,8 @@ def main():
     # tool result); re-flagging makes a missed note self-healing. In full on
     # every prompt and every Nth tool call, one line in between.
     st["runs"] = int(st.get("runs") or 0) + 1
-    # An in-session choice may be an alias ("sonnet"); label the model it
-    # was confirmed as.
-    base_name = model_label(choice["model"] if source == "/model in this session"
-                            else baseline_full)
+    base_name = model_label(base_cmp)   # a choice may be an alias: label the id it was confirmed as
     rec = recover_state(key)
-    full = (event != "PostToolUse" or changed or last is None
-            or st["runs"] % FULL_NOTE_EVERY == 1 or rec_inflight(rec))
-    if not full:
-        emit(event, (
-            f"[model-guard] Still {live_name} (id {live}); declared baseline "
-            f"{base_name} ({source}). The full note with the recovery step "
-            f"repeats on every prompt and every {FULL_NOTE_EVERY}th tool call. "
-            f"Do not claim to be {base_name}."))
-        finish()
-
     # Facts only, each with its evidence: the live model from the transcript,
     # the baseline from a named source, and whether this guard ever saw the
     # session on that baseline. The guard measures live != baseline and
@@ -593,13 +669,33 @@ def main():
         # and the staleness, interpret nothing.
         emit(event, obs + recovery_directive(rec, live_name, base_name, live_ts))
         finish()
-    declare = (f"The user declares a session meant to run on {live_name} with "
-               f"{BASELINE_ENV}={live} at launch, `model` in "
-               f"~/.claude/settings.json, or a /model in the session, and this "
-               f"note stops — that is the user's call, not yours (a /model you "
-               f"type on yourself counts as a declaration; type it only on the "
-               f"user's instruction).")
-    switched = any(same_model(baseline, x) for x in st["seen_on"])
+    # Full note on every prompt, on a transition, first sight, every Nth tool
+    # call, while a driver is in flight, and whenever what the note is about
+    # changed (recover phase/verdict/attempt, baseline, source); one line
+    # otherwise.
+    sig = "|".join(str(x) for x in ((rec or {}).get("phase"), (rec or {}).get("note"),
+                                    (rec or {}).get("attempt"), baseline_full, source))
+    full = (event != "PostToolUse" or changed or last is None
+            or st["runs"] % FULL_NOTE_EVERY == 1 or rec_inflight(rec) or sig != st.get("sig"))
+    st["sig"] = sig
+    if not full:
+        emit(event, (
+            f"[model-guard] Still {live_name} (id {live}); declared baseline "
+            f"{base_name} ({source}). The full note with the recovery step "
+            f"repeats on every prompt and every {FULL_NOTE_EVERY}th tool call. "
+            f"Do not claim to be {base_name}."))
+        finish()
+    if source == "/model in this session":
+        declare = (f"This baseline is the /model typed in this session; only a "
+                   f"newer /model typed by the user, or `model` written to "
+                   f"~/.claude/settings.json afterwards, replaces it — the "
+                   f"user's call, not yours.")
+    else:
+        declare = (f"The user declares a session meant to run on {live_name} "
+                   f"with {BASELINE_ENV}={live} at launch or `model` in "
+                   f"~/.claude/settings.json, and this note stops — that is the "
+                   f"user's call, not yours.")
+    switched = any(same_model(base_cmp, x) for x in st["seen_on"])
     if switched:
         obs += (f" This guard saw the session on {base_name} before this "
                 f"reading, so this is a mid-session move away from the "
@@ -623,15 +719,19 @@ def main():
     finish()
 
 
-def log_event(key, last, live, event):
+def log_line(key, text):
     try:
         from datetime import datetime, timezone
         ts = datetime.now(timezone.utc).strftime("%FT%TZ")
         os.makedirs(STATE_DIR, exist_ok=True)
         with open(os.path.join(STATE_DIR, "model-guard-events.log"), "a") as ev:
-            ev.write(f"{ts} session={key[:8]} {last or '(none)'} -> {live} event={event}\n")
+            ev.write(f"{ts} session={key[:8]} {text}\n")
     except Exception:
         pass
+
+
+def log_event(key, last, live, event):
+    log_line(key, f"{last or '(none)'} -> {live} event={event}")
 
 
 def emit(event, note):
