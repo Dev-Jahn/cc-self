@@ -267,6 +267,23 @@ box_line() {
 }
 box()     { box_line | sed 's/^❯ *//; s/ *$//'; }
 has_box() { [ -n "$(box_line)" ]; }
+box_framed() { norm | awk 'prev ~ /^─/ && $0 ~ /^❯/ {f=1} {prev=$0} END{exit f ? 0 : 1}'; }
+# wait_framed <max-seconds> → 0 the TUI's own (framed) box is on screen,
+# 1 timeout, 2 pane/TUI gone. A TUI that is still loading draws no box; the
+# last ❯ line on screen is then the shell prompt that launched it, which
+# box_line's unframed fallback would return — and wait_idle would call a
+# still-loading session idle (seen 2026-09-07: a wake pasted into a loading
+# TUI, verdict FAILED-WAKE on a restart that had in fact succeeded).
+wait_framed() {
+  local deadline=$(( $(date +%s) + $1 ))
+  while [ "$(date +%s)" -lt "$deadline" ]; do
+    norm >/dev/null || return 2
+    tui_alive || return 2
+    box_framed && return 0
+    sleep 1
+  done
+  return 1
+}
 # an INDENTED highlighted option (" ❯ 1. Yes, switch to …", " ❯ No, exit") =
 # some dialog/menu is up (confirm dialogs, permission prompts, pickers); the
 # input box and echoed messages sit at column 0. Dialogs REPLACE the framed
@@ -1002,18 +1019,23 @@ sleep 0.5
 "$TMUX_BIN" send-keys -t "$PANE" Enter
 for _ in $(seq 1 60); do tui_gone || break; sleep 1; done
 tui_gone && fail RELAUNCH "claude did not come back"
-log "claude relaunched → waiting for session load"
+log "claude relaunched → waiting for the TUI to draw its input box"
 set_state WAKE
-wait_idle 300; rc=$?
-[ "$rc" -eq 0 ] || fail WAKE "resumed session did not settle (rc=$rc)"
+wait_framed 300; rc=$?           # the shell prompt that launched claude is not the box
+[ "$rc" -eq 0 ] || fail WAKE "resumed session drew no input box (rc=$rc)"
+log "input box up → waiting for session load"
 WAKE='[cc-self restart driver] Automated restart sequence complete. Verify session continuity and report the result to the user.'
-if stage_exact "$WAKE" && submit "$WAKE"; then
-  set_state DONE "resumed and woken"
-  log "wake-up message sent — driver done"
-else
-  fail WAKE "could not stage/submit the wake message (box: '$(box)')"
-fi
-exit 0
+for try in 1 2; do
+  wait_idle 300; rc=$?
+  [ "$rc" -eq 0 ] || fail WAKE "resumed session did not settle (rc=$rc)"
+  if stage_exact "$WAKE" && submit "$WAKE"; then
+    set_state DONE "resumed and woken"
+    log "wake-up message sent — driver done"
+    exit 0
+  fi
+  log "wake try $try: could not stage/submit (box: '$(box)') — settling again"
+done
+fail WAKE "could not stage/submit the wake message (box: '$(box)')"
 DRV
     chmod +x "$DRIVER.tmp" && mv "$DRIVER.tmp" "$DRIVER"   # never rewrite a helper in place
     detach "/bin/bash $(shq "$DRIVER") $(shq "$PANE") $(shq "$SID") $(shq "$CLAUDE_BIN") $(shq "$TMUX_BIN") $(shq "$MODEL") $(shq "$EFFORT") $(shq "$EXTRA") $(shq "$RSTATE") $(shq "$LIB") $(shq "$ENVPFX")"

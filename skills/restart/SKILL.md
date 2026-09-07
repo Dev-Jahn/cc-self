@@ -3,7 +3,7 @@ name: restart
 description: This skill should be used when the user asks to "restart your session", "restart yourself", "reload your session", or when the session itself determines a restart is needed (e.g. after a plugin update or harness change that requires a fresh process). Restarts the current Claude Code session in place via /exit + claude --resume, preserving the full conversation.
 argument-hint: "[session-id] [-- extra-resume-flags]"
 allowed-tools: Bash
-version: 1.5.1
+version: 1.5.2
 ---
 
 # Restart Own Session
@@ -11,7 +11,8 @@ version: 1.5.1
 The session cannot restart itself directly — its own death kills its Bash tool.
 The bundled script delegates a driver to the tmux server, which outlives the
 session: it waits for the current turn to end, types `/exit`, relaunches
-`claude --resume <sid>` in the same pane, and types a wake-up message so the
+`claude --resume <sid>` in the same pane, waits for the resumed TUI to draw
+its own (framed) input box and settle, and types a wake-up message so the
 resumed session reports back.
 
 ## Procedure

@@ -27,7 +27,9 @@ a process that survives its own death (used for restart).
 - **`/cc-self:restart` command**: the session restarts itself in place —
   a driver delegated to the tmux server waits for the turn to end, types
   `/exit`, relaunches `claude --resume <session-id>` in the same pane, and
-  wakes the resumed session with a message so it reports back. Conversation
+  wakes the resumed session with a message so it reports back. The wake
+  waits for the resumed TUI to draw its own (framed) input box and settle —
+  the shell prompt that launched claude is not that box. Conversation
   history is fully preserved. Downtime ≈ 15 seconds. The session's current
   model and effort are captured before exit and pinned onto the resume
   command (`--model`/`--effort`) so effort survives the restart and the

@@ -1,7 +1,7 @@
 ---
 name: model-recovery
 description: This skill should be used when a "[model-guard]" note reports the session is running below its declared baseline model (e.g. "This session runs as Opus 4.8 … Declared baseline: Fable 5"), when the user asks to "recover the model", "switch back to the baseline model", "restore Fable 5", or after a "[cc-self recover]" verification wake message arrives. Runs the deterministic compact-first recovery built into cc-self.
-version: 1.5.1
+version: 1.5.2
 ---
 
 # Model-Fallback Recovery (deterministic, compact-first)
