@@ -22,7 +22,16 @@ purpose — then the note's instruction is conditional, and the right fix is
 for the user to declare that model (`CC_SELF_BASELINE=<id>` at launch, or pin
 settings.json), not to "recover" and not to edit the declaration yourself.
 Once a recovery has been armed for the session, the baseline counts as the
-operator's stated intent. If the fallback happened during legitimate work — a broad
+operator's stated intent. A live model that outranks the baseline is never
+flagged (a fallback only goes down). A `/model` typed in this session, once
+the next assistant record confirms it, is the newest declaration and becomes
+the session's baseline (over `CC_SELF_BASELINE`; over settings.json unless
+that was written later) — a later fallback then recovers to the chosen model,
+and the note's command names it with `--baseline`. So a `/model` you type on
+yourself is a declaration, never a way around a recovery: type it only on the
+user's instruction. A `/model` newer than the last assistant record means the
+runtime is still settling: the note says so and instructs nothing. Recover
+records older than a day are ignored. If the fallback happened during legitimate work — a broad
 safeguard over-triggering — recover with the procedure below. The note itself
 carries the attempt number to use.
 
@@ -80,9 +89,11 @@ normalized to single quotes). The instructions must:
 bash <plugin-root>/scripts/cc-self recover --compact-file <path> --attempt <N>
 ```
 
-`--baseline` defaults to `CC_SELF_BASELINE` (own session only), then `model`
-in `~/.claude/settings.json`; with neither declared `recover` refuses (nothing
-to recover to). Then **end the
+The guard's note already carries `--baseline <model>` (the baseline it
+measured against — a confirmed in-session `/model`, else `CC_SELF_BASELINE`,
+else settings.json); run the command as given. Without `--baseline`, `recover`
+resolves `CC_SELF_BASELINE` (own session only), then `model` in
+`~/.claude/settings.json`, and refuses with neither. Then **end the
 turn promptly** — the queued `/compact` only drains when the turn ends (the
 driver waits as long as the TUI is alive, up to 90 minutes, but every extra
 tool call delays the recovery). `cc-self recover --status` shows the state

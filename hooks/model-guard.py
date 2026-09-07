@@ -37,11 +37,25 @@ blocks waiting for EOF.
 Baseline and live id compare by model family: an alias ("sonnet", the form
 /model writes into settings.json), a dated snapshot ("claude-haiku-4-5-20251001",
 the form the API answers with) and the bare id all name the same model.
+
+Three more things the guard observes rather than infers: a safety fallback only
+ever goes DOWN, so a live model that outranks the declared baseline (Fable over
+Opus, 5.1 over 5) is never flagged; a `/model` command typed in this session
+(the transcript records it, with its argument or the "Set model to `X`" echo)
+whose choice the next assistant record confirms becomes the session's baseline
+— the newest declaration wins: a confirmed in-session /model over
+CC_SELF_BASELINE, and over settings.json unless settings.json was written
+later — and a `/model` newer than the last assistant record means the runtime
+is still settling. Off-baseline notes repeat on every prompt and every 10th tool call
+in full (in between, one line), and a recover state older than a day is
+ignored — a --resume keeps a session id for weeks.
 """
 import json
 import os
 import re
+import shlex
 import sys
+import time
 
 PLUGIN_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 SETTINGS = os.path.expanduser("~/.claude/settings.json")
@@ -57,6 +71,13 @@ BASELINE_ENV = "CC_SELF_BASELINE"
 # How long an in-flight recover state stays trusted before it is considered
 # stale (driver crashed / pane died) and a re-arm is instructed instead.
 INFLIGHT_FRESH_SECS = 20 * 60
+# A recover record older than this says nothing about today's runtime.
+REC_MAX_AGE_SECS = 24 * 3600
+# Full off-baseline note on every prompt; on tool calls every Nth run.
+FULL_NOTE_EVERY = 10
+INFLIGHT = ("ARMED", "COMPACT_SUBMITTED", "COMPACT_DONE", "SWITCH_SUBMITTED", "MODEL_DIALOG")
+LANDED = ("SWITCHED", "VERIFY_WAKE", "DONE")
+FAMILY_RANK = {"haiku": 1, "sonnet": 2, "opus": 3, "fable": 4}
 
 
 def state_path(transcript):
@@ -68,24 +89,34 @@ def state_path(transcript):
     return os.path.join(STATE_DIR, f"model-guard.{key}.state")
 
 
-def declared_baseline():
-    """(baseline as declared, source) — or (None, None) when nothing declares one.
-
-    The full string (e.g. "claude-fable-5[1m]") is what /model gets. Sources:
-    CC_SELF_BASELINE in the environment, then settings.json `model`. No
-    built-in default: with no declaration there is no baseline.
-    """
-    env = (os.environ.get(BASELINE_ENV) or "").strip()
-    if env:
-        return env, BASELINE_ENV
+def settings_model():
+    """(settings.json `model`, its mtime) or (None, None)."""
     try:
         s = json.load(open(SETTINGS))
         m = (s.get("model") or "").strip()
         if m:
-            return m, "~/.claude/settings.json model"
+            return m, os.path.getmtime(SETTINGS)
     except Exception:
         pass
     return None, None
+
+
+def declared_baseline():
+    """(baseline as declared, source, declared-at epoch or None) — or
+    (None, None, None) when nothing declares one.
+
+    The full string (e.g. "claude-fable-5[1m]") is what /model gets. Sources:
+    CC_SELF_BASELINE in the environment (a launch-time declaration, no
+    timestamp), then settings.json `model` (its mtime). No built-in default:
+    with no declaration there is no baseline.
+    """
+    env = (os.environ.get(BASELINE_ENV) or "").strip()
+    if env:
+        return env, BASELINE_ENV, None
+    m, ts = settings_model()
+    if m:
+        return m, "~/.claude/settings.json model", ts
+    return None, None, None
 
 
 def same_model(a, b):
@@ -108,6 +139,71 @@ def same_model(a, b):
         if any(ident == f"claude-{f}" or ident.startswith(f"claude-{f}-") for f in fams):
             return True
     return False
+
+
+def rank(model):
+    """(family rank, version tuple) for ordering models, None for an unknown
+    family. claude-fable-5-1 -> (4, (5, 1)); opus[1m] -> (3, ())."""
+    m = re.sub(r"-\d{8}$", "", str(model or "").split("[")[0].strip())
+    if m.startswith("claude-"):
+        m = m[len("claude-"):]
+    if m == "opusplan":
+        m = "opus"
+    parts = m.split("-")
+    if parts[0] not in FAMILY_RANK:
+        return None
+    return (FAMILY_RANK[parts[0]], tuple(int(x) for x in parts[1:] if x.isdigit()))
+
+
+def above_baseline(live, baseline):
+    """True when the live model outranks the declared baseline. A safety
+    fallback only ever goes down, so this is never one (a session run on a
+    higher model than the machine-wide default, by choice)."""
+    rl, rb = rank(live), rank(baseline)
+    return bool(rl and rb and rl > rb)
+
+
+def model_command(transcript_path, tail_bytes=2_097_152):
+    """The newest `/model` typed in this session (main chain): (epoch, chosen)
+    — chosen is the command argument, or for the picker the label from the
+    "Set model to `X`" echo that follows it; "" if neither is known. None when
+    no /model record is in the tail."""
+    try:
+        size = os.path.getsize(transcript_path)
+        with open(transcript_path, "rb") as f:
+            f.seek(max(0, size - tail_bytes))
+            chunk = f.read().decode("utf-8", "ignore")
+    except Exception:
+        return None
+    label = None
+    for line in reversed(chunk.splitlines()):
+        if "/model" not in line and "Set model to" not in line:
+            continue
+        try:
+            d = json.loads(line)
+        except Exception:
+            continue
+        if d.get("isSidechain") or d.get("type") != "user":
+            continue
+        c = d.get("message", {}).get("content")
+        if not isinstance(c, str):
+            continue
+        m = re.search(r"<local-command-stdout>Set model to `([^`]*)`", c)
+        if m and label is None:
+            label = m.group(1).strip()
+            continue
+        if "<command-name>/model</command-name>" in c:
+            m = re.search(r"<command-args>(.*?)</command-args>", c, re.S)
+            args = (m.group(1).strip() if m else "")
+            return (record_epoch(d.get("timestamp")) or 0, args or label or "")
+    return None
+
+
+def chosen_is(chosen, live):
+    """Does a /model choice (argument or echoed label) name the live model?"""
+    if same_model(chosen, live):
+        return True
+    return re.sub(r"\s*\(.*\)$", "", str(chosen or "")).strip() == model_label(live)
 
 
 def model_label(model_id):
@@ -183,9 +279,29 @@ def recover_state(key):
     try:
         st = json.load(open(path))
         st["_mtime"] = os.path.getmtime(path)
-        return st
     except Exception:
         return None
+    # A --resume keeps the session id for weeks: a record from days ago says
+    # nothing about today's runtime (found live by clawd: a five-day-old DONE
+    # turned a fresh reading into "fell back again, attempt 5").
+    if time.time() - st["_mtime"] > REC_MAX_AGE_SECS and not driver_alive(st):
+        return None
+    return st
+
+
+def rec_fresh(rec):
+    """An in-flight record is trusted while its driver lives, or briefly
+    (pid-less: the window between arming and the driver's first write)."""
+    if not rec:
+        return False
+    if driver_alive(rec):
+        return True
+    window = INFLIGHT_FRESH_SECS if int(rec.get("pid", 0) or 0) > 0 else 120
+    return time.time() - rec.get("_mtime", 0) < window
+
+
+def rec_inflight(rec):
+    return bool(rec and rec.get("phase", "") in INFLIGHT and rec_fresh(rec))
 
 
 def driver_alive(rec):
@@ -210,9 +326,11 @@ def driver_alive(rec):
 
 
 def load_state(path):
-    """{"last": newest model seen, "seen_on": the baseline this session was
-    last observed running on}. 1.3.x state files hold a bare model id."""
-    st = {"last": None, "seen_on": None}
+    """{"last": newest model seen, "seen_on": every baseline this session was
+    observed running on, "runs": consecutive off-baseline runs, "choice": the
+    newest /model seen}. 1.3.x state files hold a bare model id; 1.4.0 held a
+    single seen_on string."""
+    st = {"last": None, "seen_on": [], "runs": 0, "choice": None}
     try:
         raw = open(path).read().strip()
     except Exception:
@@ -222,9 +340,14 @@ def load_state(path):
     try:
         d = json.loads(raw)
         if isinstance(d, dict):
-            for k in ("last", "seen_on"):
-                v = d.get(k)
-                st[k] = v.strip() if isinstance(v, str) and v.strip() else None
+            v = d.get("last")
+            st["last"] = v.strip() if isinstance(v, str) and v.strip() else None
+            v = d.get("seen_on")
+            v = [v] if isinstance(v, str) else (v if isinstance(v, list) else [])
+            st["seen_on"] = [x.strip() for x in v if isinstance(x, str) and x.strip()]
+            st["runs"] = int(d.get("runs") or 0) if str(d.get("runs") or 0).isdigit() else 0
+            ch = d.get("choice")
+            st["choice"] = ch if isinstance(ch, dict) and "ts" in ch else None
             return st
     except Exception:
         pass
@@ -237,7 +360,7 @@ def save_state(path, st):
         os.makedirs(os.path.dirname(path), exist_ok=True)
         tmp = f"{path}.{os.getpid()}.tmp"
         with open(tmp, "w") as f:
-            f.write(json.dumps({"last": st["last"], "seen_on": st["seen_on"]}))
+            f.write(json.dumps({k: st.get(k) for k in ("last", "seen_on", "runs", "choice")}))
         os.replace(tmp, path)
     except Exception:
         pass
@@ -251,19 +374,15 @@ def stale_reading(rec, live_ts):
     exists; transcript flush can lag a few tool calls more). Such a reading
     proves nothing about the current runtime — unless the driver itself saw a
     post-wake off-baseline record ("re-fell"), which IS post-switch truth."""
-    import time
     if not rec or live_ts is None:
         return False
-    phase = rec.get("phase", "")
-    alive = driver_alive(rec)
-    window = INFLIGHT_FRESH_SECS if int(rec.get("pid", 0) or 0) > 0 else 120
-    fresh = alive or time.time() - rec.get("_mtime", 0) < window
-    return (phase in ("SWITCHED", "VERIFY_WAKE", "DONE") and fresh
+    return (rec.get("phase", "") in LANDED and rec_fresh(rec)
             and live_ts <= rec.get("_mtime", 0)
             and not str(rec.get("note", "")).startswith("re-fell"))
 
 
-def recovery_directive(rec, live_name, base_name, live_ts=None, switched=True):
+def recovery_directive(rec, live_name, base_name, live_ts=None, switched=True,
+                       baseline_full=None):
     """The recovery instruction appended to every off-baseline note.
 
     The model's ONLY job is filling the compact template; `cc-self recover`
@@ -274,19 +393,13 @@ def recovery_directive(rec, live_name, base_name, live_ts=None, switched=True):
     never saw it there — then the instruction is conditional, because a
     deliberate launch on another model measures exactly the same.
     """
-    import time
     phase = (rec or {}).get("phase", "")
     note = str((rec or {}).get("note", ""))
     attempt_prev = int((rec or {}).get("attempt", 0) or 0)
     attempt_next = attempt_prev + 1 if rec else 1
     alive = driver_alive(rec)
-    # A pid-less state is the short window between arming and the driver's
-    # first write (or a CLI that died before detaching): trust it briefly.
-    window = INFLIGHT_FRESH_SECS if int((rec or {}).get("pid", 0) or 0) > 0 else 120
-    fresh = rec and (alive or time.time() - rec.get("_mtime", 0) < window)
-    inflight = ("ARMED", "COMPACT_SUBMITTED", "COMPACT_DONE",
-                "SWITCH_SUBMITTED", "MODEL_DIALOG")
-    landed = ("SWITCHED", "VERIFY_WAKE", "DONE")
+    fresh = rec_fresh(rec)
+    inflight, landed = INFLIGHT, LANDED
 
     # Terminal: an operator explicitly closed this recovery (cc-self recover
     # --close). State the fact, instruct nothing.
@@ -338,7 +451,9 @@ def recovery_directive(rec, live_name, base_name, live_ts=None, switched=True):
         f"all work context, abstract the fallback-trigger content into "
         f"neutral terms (the higher the attempt, the stronger the "
         f"abstraction) — then run `bash {PLUGIN_ROOT}/scripts/cc-self recover "
-        f"--compact-file <path> --attempt {attempt_next}` and end the turn. "
+        f"--compact-file <path> --attempt {attempt_next}"
+        f"{' --baseline ' + shlex.quote(baseline_full) if baseline_full else ''}` "
+        f"and end the turn. "
         f"The driver handles everything after that (compact, /model "
         f"{base_name} switch, dialog, verification, wake).")
     if attempt_next >= 3:
@@ -368,51 +483,98 @@ def main():
     if not live:
         sys.exit(0)
 
-    baseline_full, source = declared_baseline()
-    baseline = baseline_full.split("[")[0].strip() if baseline_full else None
+    baseline_full, source, declared_ts = declared_baseline()
     spath = state_path(transcript)
     st = load_state(spath)
     last = st["last"]
     changed = (last is not None and last != live)
+    key = os.path.basename(transcript or "?").rsplit(".", 1)[0]
+    st["last"] = live
+    if changed or last is None:
+        log_event(key, last, live, event)   # every transition, on or off baseline
+    live_name = model_label(live)
+    # The newest /model typed in this session, remembered beyond the tail
+    # window the transcript scan covers. Its choice is CONFIRMED by the first
+    # assistant record that matches it; a confirmed choice is the newest
+    # declaration of what this session should run on, so it becomes the
+    # baseline — over CC_SELF_BASELINE (launch time), and over settings.json
+    # unless settings.json was written after it.
+    cmd = model_command(transcript) if transcript else None
+    if cmd and cmd[0] and (not st["choice"] or cmd[0] > float(st["choice"].get("ts") or 0)):
+        st["choice"] = {"ts": cmd[0], "chosen": cmd[1]}
+        log_event(key, last, live, f"{event} /model {cmd[1] or '(picker)'}")
+    choice = st["choice"] or {}
+    pending = bool(choice and live_ts is not None and float(choice.get("ts") or 0) > live_ts)
+    if (choice.get("chosen") and not choice.get("model") and not pending
+            and chosen_is(choice["chosen"], live)):
+        sm, _ = settings_model()
+        choice["model"] = live
+        choice["full"] = (sm if sm and same_model(sm, live) else
+                          choice["chosen"] if same_model(choice["chosen"], live) else live)
+        st["choice"] = choice
+    if choice.get("model") and (declared_ts is None or float(choice.get("ts") or 0) >= declared_ts):
+        baseline_full, source = choice["full"], "/model in this session"
+    baseline = baseline_full.split("[")[0].strip() if baseline_full else None
     # "Seen on the baseline" is this guard's own observation: the previous
     # run's reading (covers 1.3.x bare-id state files) or this one.
     if baseline and (same_model(baseline, last) or same_model(baseline, live)):
-        st["seen_on"] = baseline
-    st["last"] = live
-    save_state(spath, st)
-    key = os.path.basename(transcript or "?").rsplit(".", 1)[0]
+        if not any(same_model(baseline, x) for x in st["seen_on"]):
+            st["seen_on"].append(baseline)
+
+    def finish():
+        save_state(spath, st)
+        sys.exit(0)
 
     if baseline is None:
         # Nothing declared: no divergence to measure. Report an observed
         # transition once, instruct nothing, otherwise stay silent.
-        if not changed:
-            sys.exit(0)
-        log_event(key, last, live, event)
+        st["runs"] = 0
+        if changed:
+            emit(event, (
+                f"[model-guard] Runtime model changed: {model_label(last)} → "
+                f"{live_name} (id {live}), read from this session's "
+                f"transcript. No baseline is declared ({BASELINE_ENV} unset, no "
+                f"`model` in ~/.claude/settings.json), so the guard measures no "
+                f"divergence and instructs nothing; declare one to enable "
+                f"recovery. Do not claim to be {model_label(last)}."))
+        finish()
+
+    # Silent on the declared baseline — and above it: a safety fallback only
+    # ever goes down, so a session on a higher model is not one.
+    if same_model(baseline, live) or above_baseline(live, baseline):
+        st["runs"] = 0
+        finish()
+    # A /model newer than the last assistant record: the runtime is settling.
+    if pending:
+        st["runs"] = 0
         emit(event, (
-            f"[model-guard] Runtime model changed: {model_label(last)} → "
-            f"{model_label(live)} (id {live}), read from this session's "
-            f"transcript. No baseline is declared ({BASELINE_ENV} unset, no "
-            f"`model` in ~/.claude/settings.json), so the guard measures no "
-            f"divergence and instructs nothing; declare one to enable "
-            f"recovery. Do not claim to be {model_label(last)}."))
-        sys.exit(0)
+            f"[model-guard] A /model command ({choice.get('chosen') or 'picker'}) "
+            f"was issued in this session after its last assistant record "
+            f"({live_name}, id {live}); the runtime model is settling and the "
+            f"next assistant record decides. Nothing to do now — do not arm "
+            f"a recovery from this note."))
+        finish()
 
-    # Stay silent ONLY when we're on the declared baseline. Being OFF baseline
-    # is a PERSISTENT hazard, so we re-flag on EVERY run until it's restored —
-    # a single note can be missed (buried under a large tool result); re-
-    # flagging every run makes a missed note self-healing.
-    if same_model(baseline, live):
-        sys.exit(0)
-
-    # Append a fallback-history line only on an actual TRANSITION (or first
-    # sight) — off-baseline re-flags every run by design, so without this
-    # guard the log gains one identical "X -> X" row per tool call.
-    if changed or last is None:
-        log_event(key, last, live, event)
-
-    live_name = model_label(live)
-    base_name = model_label(baseline_full)
+    # Being OFF baseline is a PERSISTENT hazard, so we re-flag on EVERY run
+    # until it's restored — a single note can be missed (buried under a large
+    # tool result); re-flagging makes a missed note self-healing. In full on
+    # every prompt and every Nth tool call, one line in between.
+    st["runs"] = int(st.get("runs") or 0) + 1
+    # An in-session choice may be an alias ("sonnet"); label the model it
+    # was confirmed as.
+    base_name = model_label(choice["model"] if source == "/model in this session"
+                            else baseline_full)
     rec = recover_state(key)
+    full = (event != "PostToolUse" or changed or last is None
+            or st["runs"] % FULL_NOTE_EVERY == 1 or rec_inflight(rec))
+    if not full:
+        emit(event, (
+            f"[model-guard] Still {live_name} (id {live}); declared baseline "
+            f"{base_name} ({source}). The full note with the recovery step "
+            f"repeats on every prompt and every {FULL_NOTE_EVERY}th tool call. "
+            f"Do not claim to be {base_name}."))
+        finish()
+
     # Facts only, each with its evidence: the live model from the transcript,
     # the baseline from a named source, and whether this guard ever saw the
     # session on that baseline. The guard measures live != baseline and
@@ -430,12 +592,14 @@ def main():
         # The reading predates a just-completed switch: state the two facts
         # and the staleness, interpret nothing.
         emit(event, obs + recovery_directive(rec, live_name, base_name, live_ts))
-        sys.exit(0)
+        finish()
     declare = (f"The user declares a session meant to run on {live_name} with "
-               f"{BASELINE_ENV}={live} at launch or `model` in "
-               f"~/.claude/settings.json, and this note stops — that is the "
-               f"user's call, not yours.")
-    switched = same_model(baseline, st["seen_on"])
+               f"{BASELINE_ENV}={live} at launch, `model` in "
+               f"~/.claude/settings.json, or a /model in the session, and this "
+               f"note stops — that is the user's call, not yours (a /model you "
+               f"type on yourself counts as a declaration; type it only on the "
+               f"user's instruction).")
+    switched = any(same_model(baseline, x) for x in st["seen_on"])
     if switched:
         obs += (f" This guard saw the session on {base_name} before this "
                 f"reading, so this is a mid-session move away from the "
@@ -453,9 +617,10 @@ def main():
                 f"safety fallback and a session deliberately run on "
                 f"{live_name} measure the same here. {declare}")
     note = obs + f" Do not claim to be {base_name}."
-    note += recovery_directive(rec, live_name, base_name, live_ts, switched)
+    note += recovery_directive(rec, live_name, base_name, live_ts, switched,
+                               baseline_full)
     emit(event, note)
-    sys.exit(0)
+    finish()
 
 
 def log_event(key, last, live, event):

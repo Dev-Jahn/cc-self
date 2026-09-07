@@ -35,6 +35,13 @@ jobs:
           python3 -m py_compile hooks/model-guard.py
           jq -e '.hooks.UserPromptSubmit and .hooks.PostToolUse' hooks/hooks.json
 
+      - name: model-guard behavioural matrix
+        # Synthetic transcripts under a scratch HOME; every case is a field
+        # report or a review finding (see the script's comments).
+        run: |
+          shellcheck -s bash tests/guard-matrix.sh
+          bash tests/guard-matrix.sh
+
       - name: plugin manifest parses
         run: |
           jq -e '.name == "cc-self" and .version and .description' .claude-plugin/plugin.json

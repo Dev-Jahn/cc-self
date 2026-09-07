@@ -43,8 +43,14 @@ a process that survives its own death (used for restart).
   `~/.claude/settings.json`; nothing declared means no baseline, so the guard
   then only reports model transitions and instructs nothing — there is no
   built-in default; ids, dated snapshots and aliases such as `sonnet` compare
-  by model family). Every note names the baseline's source and whether the
-  guard ever saw the session on it, and embeds the exact recovery step. The model's
+  by model family). A fallback only ever goes down, so a session above its
+  baseline is never flagged. A `/model` typed in the session, once the next
+  assistant record confirms it, is the newest declaration and becomes the
+  session's baseline (over `CC_SELF_BASELINE`; over settings.json unless that
+  was written later), so a later fallback recovers to the chosen model. Every note names the
+  baseline's source and whether the guard ever saw the session on it, and
+  embeds the exact recovery step (in full on every prompt and every 10th tool
+  call, one line in between). The model's
   only job is writing a compact instruction file (preserve context, abstract
   the trigger content); `cc-self recover` then submits `/compact` and a
   detached driver waits out the compaction (transcript truth: the
